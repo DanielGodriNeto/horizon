@@ -13,7 +13,8 @@ Horizon's own format.
 | Authoring tool | `horizon-shader` (same crate) | `new`, `check`, `pack` |
 | Templates | `crates/horizon-shader-api/templates/` | post, sky, material |
 | Example pack | `crates/horizon-shader-api/packs/golden_hour` | a warm sky and two post passes |
-| In the game, the launcher, the registry | | not yet: the renderer hooks come next |
+| In the game: the post stage | `HORIZON_SHADER_PACK=<name>` (for development, until the Shader Packs page) | post passes, hot reload |
+| In the game: sky and material; the launcher and the registry | | not yet |
 
 ## Quick start
 
@@ -42,6 +43,15 @@ my_pack 0.1.0 (shader API 0.1): FAILED
 ```
 
 `--json` prints the same for tools (`ok`, `id`, `version`, `api`, `sha256`, `stages`, `problems`).
+
+## Trying a pack in the game
+
+Until the Shader Packs page lists them, put the pack folder (or its `.hshader`) in `shaderpacks/` beside `options.txt`
+and start the game with `HORIZON_SHADER_PACK=<its folder or file name>`. The game checks the pack first, and refuses
+one that fails, with its problems in the chat. While it runs, the game looks at the pack twice a second: save a file
+and the pack is checked and rebuilt in place ("Shader pack ... reloaded"); if the new version fails, the chat says
+where and the last good version keeps drawing. The post passes run today; the sky and material stages are checked
+but not drawn yet.
 
 ## A pack
 

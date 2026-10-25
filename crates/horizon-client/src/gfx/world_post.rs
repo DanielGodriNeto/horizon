@@ -224,6 +224,8 @@ impl Post {
 pub enum Chain {
     /// A shader pack in the `shaders/` format (`pack_post.rs`).
     Java(super::pack_post::PackPost),
+    /// The post passes of one of Horizon's own shader packs (`native_post.rs`).
+    Native(super::native_post::NativePost),
 }
 
 impl Chain {
@@ -252,6 +254,7 @@ impl Chain {
                 size,
                 window,
             ),
+            Chain::Native(post) => post.run(device, queue, encoder, world, screen, frame, size),
         }
     }
 }

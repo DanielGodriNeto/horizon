@@ -67,6 +67,7 @@ mod end_sky;
 mod flat;
 pub mod lightning;
 mod lod;
+mod native_post;
 mod occlusion;
 mod pack_atlas;
 mod pack_post;
@@ -2798,6 +2799,36 @@ impl Renderer {
         self.post_chain = post.map(world_post::Chain::Java);
         self.shader_pack_dimension = Some(dimension);
         report
+    }
+    /// Runs the post passes of one of Horizon's own shader packs over the world from now on
+    /// (`None`: no pack), with its options' values; replaces any other chain. Returns the
+    /// passes' labels; on an error the chain that ran keeps running.
+    pub fn set_native_shader_pack(
+        &mut self,
+        pack: Option<(horizon_shader_api::Report, Vec<(String, f64)>)>,
+    ) -> std::result::Result<Vec<String>, String> {
+        let Some((report, constants)) = pack else {
+            if matches!(self.post_chain, Some(world_post::Chain::Native(_))) {
+                self.post_chain = None;
+            }
+            return Ok(Vec::new());
+        };
+        let post: Vec<_> = report
+            .stages
+            .into_iter()
+            .filter(|s| s.kind == horizon_shader_api::StageKind::Post)
+            .collect();
+        if post.is_empty() {
+            self.post_chain = None;
+            return Ok(Vec::new());
+        }
+        let format = self.config.format.remove_srgb_suffix();
+        let post = native_post::NativePost::new(&self.device, post, &constants, format)?;
+        let labels = post.labels().into_iter().map(str::to_owned).collect();
+        self.pack_atlas = None;
+        self.shader_pack_dimension = None;
+        self.post_chain = Some(world_post::Chain::Native(post));
+        Ok(labels)
     }
     /// The dimension the shader pack was last set for.
     pub fn shader_pack_dimension(&self) -> Option<i32> {
