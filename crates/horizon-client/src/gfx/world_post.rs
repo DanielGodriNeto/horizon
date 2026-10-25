@@ -254,7 +254,7 @@ impl Chain {
                 size,
                 window,
             ),
-            Chain::Native(post) => post.run(device, queue, encoder, world, screen, frame, size),
+            Chain::Native(post) => post.run(device, encoder, world, screen, size),
         }
     }
 }

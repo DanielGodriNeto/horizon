@@ -68,6 +68,7 @@ mod flat;
 pub mod lightning;
 mod lod;
 mod native_post;
+mod native_sky;
 mod occlusion;
 mod pack_atlas;
 mod pack_post;
@@ -474,6 +475,9 @@ pub struct Renderer {
     world_post: world_post::Post,
     /// The post-processing chain over the world, if any (`world_post::Chain`).
     post_chain: Option<world_post::Chain>,
+    /// The frame Horizon's own shader pack reads, and its sky stage (docs/shaders.md).
+    native_frame: Option<native_post::NativeFrame>,
+    native_sky: Option<native_sky::NativeSky>,
     /// The dimension (legacy id) the shader pack was last set for.
     shader_pack_dimension: Option<i32>,
     /// The block sprites as one atlas, while a shader pack is loaded.
@@ -2326,6 +2330,8 @@ impl Renderer {
             occlusion: occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16),
             world_post,
             post_chain: None,
+            native_frame: None,
+            native_sky: None,
             shader_pack_dimension: None,
             pack_atlas: None,
             hud,
@@ -2800,34 +2806,61 @@ impl Renderer {
         self.shader_pack_dimension = Some(dimension);
         report
     }
-    /// Runs the post passes of one of Horizon's own shader packs over the world from now on
-    /// (`None`: no pack), with its options' values; replaces any other chain. Returns the
-    /// passes' labels; on an error the chain that ran keeps running.
+    /// Runs the sky and post stages of one of Horizon's own shader packs from now on (`None`:
+    /// no pack), with its options' values; replaces any other post chain. Returns the stages'
+    /// labels; on an error the pack that ran keeps running.
     pub fn set_native_shader_pack(
         &mut self,
         pack: Option<(horizon_shader_api::Report, Vec<(String, f64)>)>,
     ) -> std::result::Result<Vec<String>, String> {
+        use horizon_shader_api::StageKind;
         let Some((report, constants)) = pack else {
             if matches!(self.post_chain, Some(world_post::Chain::Native(_))) {
                 self.post_chain = None;
             }
+            self.native_sky = None;
+            self.native_frame = None;
             return Ok(Vec::new());
         };
-        let post: Vec<_> = report
+        let format = self.config.format.remove_srgb_suffix();
+        let frame = native_post::NativeFrame::new(&self.device);
+        let (post, others): (Vec<_>, Vec<_>) = report
             .stages
             .into_iter()
-            .filter(|s| s.kind == horizon_shader_api::StageKind::Post)
-            .collect();
-        if post.is_empty() {
-            self.post_chain = None;
-            return Ok(Vec::new());
+            .partition(|s| s.kind == StageKind::Post);
+        let sky = match others.iter().find(|s| s.kind == StageKind::Sky) {
+            Some(stage) => Some(native_sky::NativeSky::new(
+                &self.device,
+                &self.terrain_layout,
+                &frame,
+                stage,
+                &constants,
+                format,
+            )?),
+            None => None,
+        };
+        let post = if post.is_empty() {
+            None
+        } else {
+            Some(native_post::NativePost::new(
+                &self.device,
+                post,
+                &constants,
+                format,
+                &frame,
+            )?)
+        };
+        let mut labels: Vec<String> = sky.iter().map(|s| s.label.clone()).collect();
+        if let Some(post) = &post {
+            labels.extend(post.labels().into_iter().map(str::to_owned));
         }
-        let format = self.config.format.remove_srgb_suffix();
-        let post = native_post::NativePost::new(&self.device, post, &constants, format)?;
-        let labels = post.labels().into_iter().map(str::to_owned).collect();
-        self.pack_atlas = None;
-        self.shader_pack_dimension = None;
-        self.post_chain = Some(world_post::Chain::Native(post));
+        if post.is_some() {
+            self.pack_atlas = None;
+            self.shader_pack_dimension = None;
+        }
+        self.post_chain = post.map(world_post::Chain::Native);
+        self.native_sky = sky;
+        self.native_frame = Some(frame);
         Ok(labels)
     }
     /// The dimension the shader pack was last set for.
@@ -3716,6 +3749,16 @@ impl Renderer {
             Some((color, depth)) => (color, depth),
             None => (&view_target, &self.depth),
         };
+        if let Some(native) = &mut self.native_frame
+            && !frame.title
+        {
+            let size = self
+                .world_post
+                .size()
+                .filter(|_| scaled.is_some())
+                .unwrap_or([self.config.width, self.config.height]);
+            native.write(&self.queue, frame, size);
+        }
         if culling && let Some(cull) = &mut self.cull {
             cull.bind_depth(&self.device, world_depth);
         }
@@ -3767,8 +3810,13 @@ impl Renderer {
             };
             if frame.title || (sky_visible && (frame.skybox || frame.end_sky)) {
                 if !frame.title && frame.skybox {
-                    pass.set_pipeline(&self.sky);
-                    pass.draw(0..3, 0..1);
+                    match (&self.native_sky, &self.native_frame) {
+                        (Some(sky), Some(native)) => sky.draw(&mut pass, native),
+                        _ => {
+                            pass.set_pipeline(&self.sky);
+                            pass.draw(0..3, 0..1);
+                        }
+                    }
                 }
                 if frame.title {
                     self.panorama.draw(&mut pass);

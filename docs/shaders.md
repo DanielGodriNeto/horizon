@@ -13,8 +13,8 @@ Horizon's own format.
 | Authoring tool | `horizon-shader` (same crate) | `new`, `check`, `pack` |
 | Templates | `crates/horizon-shader-api/templates/` | post, sky, material |
 | Example pack | `crates/horizon-shader-api/packs/golden_hour` | a warm sky and two post passes |
-| In the game: the post stage | `HORIZON_SHADER_PACK=<name>` (for development, until the Shader Packs page) | post passes, hot reload |
-| In the game: sky and material; the launcher and the registry | | not yet |
+| In the game: the sky and post stages | `HORIZON_SHADER_PACK=<name>` (for development, until the Shader Packs page) | sky, post passes, hot reload |
+| In the game: the material stage; the launcher and the registry | | not yet |
 
 ## Quick start
 
@@ -50,8 +50,8 @@ Until the Shader Packs page lists them, put the pack folder (or its `.hshader`) 
 and start the game with `HORIZON_SHADER_PACK=<its folder or file name>`. The game checks the pack first, and refuses
 one that fails, with its problems in the chat. While it runs, the game looks at the pack twice a second: save a file
 and the pack is checked and rebuilt in place ("Shader pack ... reloaded"); if the new version fails, the chat says
-where and the last good version keeps drawing. The post passes run today; the sky and material stages are checked
-but not drawn yet.
+where and the last good version keeps drawing. The sky and post stages run today; the material stage is checked but
+not drawn yet.
 
 ## A pack
 
@@ -86,7 +86,7 @@ by Horizon: a pack changes how things look, not how they are drawn.
 
 | Stage | Your function | What it does |
 | --- | --- | --- |
-| `[sky]` | `fn sky(input: SkyInput) -> vec4<f32>` | the sky's colour along each view ray; the sun, moon, stars and clouds are drawn over it |
+| `[sky]` | `fn sky(input: SkyInput) -> vec4<f32>` | the sky's colour along each view ray, opaque (alpha is ignored); the sun, moon, stars and clouds are drawn over it. drawn where vanilla draws its sky dome (the Overworld's sky; not the Nether's or the End's) |
 | `[material]` | `fn material(input: MaterialInput) -> Surface` | the lit colour of each point of a block's surface, before the alpha test and fog |
 | `[[post]]` | `fn post(input: PostInput) -> vec4<f32>` | a full-screen pass over the world's picture (up to 8, in order), under the hand and HUD |
 
@@ -132,6 +132,5 @@ against it.
 
 ## Next
 
-The renderer hooks (shared with the Iris/OptiFine loader), then the post stage in the game with hot reload and the
-GPU time per pass, Options > Shader packs listing these packs, then the material and sky stages, and the registry's
-`shader` kind with installs from the launcher.
+The material stage in the game, the GPU time per pass in the F3 overlay, Options > Shader packs listing these packs,
+and the registry's `shader` kind with installs from the launcher.
