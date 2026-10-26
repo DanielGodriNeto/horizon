@@ -739,30 +739,34 @@ pub fn relight(
     force: bool,
     changed: &mut LightChanges,
 ) {
-    relight_layer(world, tables, false, positions.to_vec(), force, changed);
+    crate::spans::time("lt_block", || {
+        relight_layer(world, tables, false, positions.to_vec(), force, changed)
+    });
     if sky_light {
         let mut seeds = positions.to_vec();
         let mut columns: HashMap<(i32, i32), i32> = HashMap::new();
-        for &(x, _, z) in positions {
-            if columns.contains_key(&(x, z)) {
-                continue;
-            }
-            let source = lowest_sky_source(world, tables, x, z);
-            columns.insert((x, z), source);
-            // Cells whose source status changed: non-15 at or above the new
-            // lowest source, and old 15s (sources) below it.
-            for y in source..MIN_Y + HEIGHT {
-                if level(world, true, (x, y, z)).is_some_and(|l| l != 15) {
+        crate::spans::time("lt_columns", || {
+            for &(x, _, z) in positions {
+                if columns.contains_key(&(x, z)) {
+                    continue;
+                }
+                let source = lowest_sky_source(world, tables, x, z);
+                columns.insert((x, z), source);
+                // Cells whose source status changed: non-15 at or above the new
+                // lowest source, and old 15s (sources) below it.
+                for y in source..MIN_Y + HEIGHT {
+                    if level(world, true, (x, y, z)).is_some_and(|l| l != 15) {
+                        seeds.push((x, y, z));
+                    }
+                }
+                let mut y = source - 1;
+                while y >= MIN_Y && level(world, true, (x, y, z)) == Some(15) {
                     seeds.push((x, y, z));
+                    y -= 1;
                 }
             }
-            let mut y = source - 1;
-            while y >= MIN_Y && level(world, true, (x, y, z)) == Some(15) {
-                seeds.push((x, y, z));
-                y -= 1;
-            }
-        }
-        relight_layer(world, tables, true, seeds, force, changed);
+        });
+        crate::spans::time("lt_sky", || relight_layer(world, tables, true, seeds, force, changed));
     }
 }
 fn relight_layer(
@@ -810,23 +814,25 @@ fn relight_layer(
     }
     // Sources inside the cleared area light up again.
     let mut sources: HashMap<(i32, i32), i32> = HashMap::new();
-    for p in cleared {
-        let seed = if sky {
-            let lowest = *sources
-                .entry((p.0, p.2))
-                .or_insert_with(|| lowest_sky_source(world, tables, p.0, p.2));
-            if p.1 >= lowest { 15 } else { 0 }
-        } else {
-            world
-                .state(p.0, p.1, p.2)
-                .map_or(0, |s| tables.cells[s as usize].emission)
-        };
-        if seed > level(world, sky, p).unwrap_or(15) {
-            set_level(world, sky, p, seed);
-            changed.push(p);
-            increase.push_back(p);
+    crate::spans::time("lt_sources", || {
+        for p in cleared {
+            let seed = if sky {
+                let lowest = *sources
+                    .entry((p.0, p.2))
+                    .or_insert_with(|| lowest_sky_source(world, tables, p.0, p.2));
+                if p.1 >= lowest { 15 } else { 0 }
+            } else {
+                world
+                    .state(p.0, p.1, p.2)
+                    .map_or(0, |s| tables.cells[s as usize].emission)
+            };
+            if seed > level(world, sky, p).unwrap_or(15) {
+                set_level(world, sky, p, seed);
+                changed.push(p);
+                increase.push_back(p);
+            }
         }
-    }
+    });
     while let Some(p) = increase.pop_front() {
         let Some(l) = level(world, sky, p) else {
             continue;
