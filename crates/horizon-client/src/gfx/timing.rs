@@ -34,6 +34,8 @@ const MAPPED: u8 = 4;
 struct Slot {
     buffer: wgpu::Buffer,
     state: Arc<AtomicU8>,
+    /// The number of the frame it times.
+    frame: u64,
 }
 
 pub struct GpuTimer {
@@ -48,6 +50,8 @@ pub struct GpuTimer {
     markers: Option<Markers>,
     /// Slots resolved in this frame's commands, read back once it is submitted.
     resolved: Vec<usize>,
+    /// Frames begun so far: the next frame's number.
+    frames: u64,
 }
 
 /// The marker passes: the start's compute pipeline, and the end's shader and
@@ -97,6 +101,7 @@ impl GpuTimer {
                     mapped_at_creation: false,
                 }),
                 state: Arc::new(AtomicU8::new(FREE)),
+                frame: 0,
             })
             .collect();
         Some(Self {
@@ -128,6 +133,7 @@ impl GpuTimer {
                 }
             }),
             resolved: Vec::new(),
+            frames: 0,
         })
     }
     pub fn begin(&mut self, encoder: &mut wgpu::CommandEncoder) {
@@ -139,8 +145,11 @@ impl GpuTimer {
             }
         }
         let slot = self.next;
+        let frame = self.frames;
+        self.frames += 1;
         self.current = (self.slots[slot].state.load(Ordering::Acquire) == FREE).then_some(slot);
         let Some(slot) = self.current else { return };
+        self.slots[slot].frame = frame;
         let index = 2 * slot as u32;
         let Some(markers) = &self.markers else {
             encoder.write_timestamp(&self.queries, index);
@@ -231,8 +240,13 @@ impl GpuTimer {
         }
         self.next = (slot + 1) % SLOTS;
     }
-    /// GPU milliseconds of frames whose timestamps have arrived, oldest first.
-    pub fn collect(&mut self, device: &wgpu::Device, out: &mut Vec<f32>) {
+    /// Frames begun so far: the last frame's number plus one.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+    /// Number and GPU milliseconds of frames whose timestamps have arrived,
+    /// oldest first.
+    pub fn collect(&mut self, device: &wgpu::Device, out: &mut Vec<(u64, f32)>) {
         let _ = device.poll(wgpu::PollType::Poll);
         for i in 0..SLOTS {
             let slot = &self.slots[(self.next + i) % SLOTS];
@@ -244,7 +258,8 @@ impl GpuTimer {
                 let stamps: [u64; 2] = bytemuck::pod_read_unaligned(&data[..16]);
                 // A start marker that ran late (rare on Metal) leaves the frame untimed.
                 if let Some(ticks) = stamps[1].checked_sub(stamps[0]) {
-                    out.push((ticks as f64 * f64::from(self.period_ns) / 1e6) as f32);
+                    let ms = (ticks as f64 * f64::from(self.period_ns) / 1e6) as f32;
+                    out.push((slot.frame, ms));
                 }
             }
             slot.buffer.unmap();

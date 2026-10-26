@@ -348,14 +348,17 @@ pub struct Renderer {
     /// (see `startup_step`).
     first_frame: FirstFrame,
     gpu_timer: Option<timing::GpuTimer>,
-    /// GPU frame times (ms) read back since the caller last drained them.
-    pub gpu_times: Vec<f32>,
+    /// Frame number and GPU frame time (ms) of the frames read back since
+    /// the caller last drained them.
+    pub gpu_times: Vec<(u64, f32)>,
     /// The last lightmap written, RGBA rows of sky level by block level
     /// (F3+4 shows it).
     pub lightmap_pixels: [u8; 16 * 16 * 4],
     /// Time the last `render` spent blocked on the GPU or the display
     /// (acquiring, presenting, offscreen pacing), excluded from CPU time.
     pub last_wait: std::time::Duration,
+    /// The part of `last_wait` spent acquiring the frame's surface texture.
+    pub last_acquire: std::time::Duration,
     /// CPU time of the last `render`, waits excluded.
     pub last_encode: std::time::Duration,
     window: Arc<Window>,
@@ -2346,6 +2349,7 @@ impl Renderer {
             gpu_times: Vec::new(),
             lightmap_pixels: [0; 16 * 16 * 4],
             last_wait: std::time::Duration::ZERO,
+            last_acquire: std::time::Duration::ZERO,
             last_encode: std::time::Duration::ZERO,
             window,
             device,
@@ -2576,6 +2580,10 @@ impl Renderer {
                 view_formats: &[],
             })
             .create_view(&Default::default())
+    }
+    /// The GPU timer's number for the next frame drawn, with timing on.
+    pub fn gpu_frames(&self) -> Option<u64> {
+        self.gpu_timer.as_ref().map(timing::GpuTimer::frames)
     }
     /// VSync on presents with Fifo, capped to the display's refresh rate in a
     /// window and in fullscreen alike; Horizon's present-mode setting applies
@@ -3344,6 +3352,7 @@ impl Renderer {
         let acquire = Instant::now();
         let acquired = self.surface.as_ref().map(|s| s.get_current_texture());
         self.last_wait = acquire.elapsed();
+        self.last_acquire = self.last_wait;
         let (surface_frame, reconfigure) = match acquired {
             None => (None, false),
             Some(wgpu::CurrentSurfaceTexture::Success(f)) => (Some(f), false),

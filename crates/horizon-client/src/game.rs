@@ -1214,6 +1214,17 @@ fn select_creative_tab(
     clicks.skip_release();
 }
 
+/// A measured flight frame's breakdown (`HORIZON_SPIKES`), logged when the
+/// time to the next frame, what the benchmark counts, is slow.
+struct FlightFrame {
+    wall: Duration,
+    acquire: Duration,
+    present: Duration,
+    /// The GPU timer's number for it, matching a `slow gpu frame` line.
+    gpu_frame: Option<u64>,
+    spans: String,
+}
+
 struct Game<'a> {
     /// Shared with an integrated server; `collision` and `motion` borrow from it.
     res: Arc<Resources>,
@@ -1413,10 +1424,8 @@ struct Game<'a> {
     scope_scale: f32,
     /// Duration of the last frame in ticks (GUI easing).
     frame_ticks: f32,
-    /// With `HORIZON_SPIKES` during a measured flight: the last frame's wall
-    /// time, its GPU wait and its spans, logged when the time to the next
-    /// frame (what the benchmark counts) is slow.
-    flight_frame: Option<(Duration, Duration, String)>,
+    /// With `HORIZON_SPIKES`, the last frame of a measured flight.
+    flight_frame: Option<FlightFrame>,
     title: Option<Title>,
     /// Armor slots: head, chest, legs, feet.
     armor: [Option<ItemStack>; 4],
@@ -12270,16 +12279,19 @@ impl ApplicationHandler for Game<'_> {
                         .and_then(|_| horizon_client::spans::thread_cpu());
                     let elapsed = now.duration_since(self.previous);
                     if let Some(threshold) = self.options.spikes
-                        && let Some((wall, wait, spans)) = self.flight_frame.take()
+                        && let Some(f) = self.flight_frame.take()
                         && elapsed.as_secs_f32() * 1000.0 > threshold
                     {
                         let ms = |d: Duration| d.as_secs_f32() * 1000.0;
                         log::info!(
-                            "Horizon: slow flight frame {:.1} ms: frame {:.1} ms (gpu wait {:.1}), between frames {:.1}: {spans}",
+                            "Horizon: slow flight frame {:.1} ms: frame {:.1} ms (acquire {:.1}, present {:.1}), between frames {:.1}, gpu #{}: {}",
                             ms(elapsed),
-                            ms(wall),
-                            ms(wait),
-                            ms(elapsed.saturating_sub(wall))
+                            ms(f.wall),
+                            ms(f.acquire),
+                            ms(f.present),
+                            ms(elapsed.saturating_sub(f.wall)),
+                            f.gpu_frame.map_or_else(|| "-".into(), |n| n.to_string()),
+                            f.spans
                         );
                     }
                     self.frame_ticks = elapsed.as_secs_f32() * 20.0;
@@ -12369,9 +12381,15 @@ impl ApplicationHandler for Game<'_> {
                                 horizon_client::spans::describe(&spans)
                             );
                         }
-                        self.flight_frame = self.flight.as_ref().is_some_and(|f| f.raw).then(|| {
-                            (now.elapsed(), r.last_wait, horizon_client::spans::describe(&spans))
-                        });
+                        self.flight_frame =
+                            self.flight.as_ref().is_some_and(|f| f.raw).then(|| FlightFrame {
+                                wall: now.elapsed(),
+                                acquire: r.last_acquire,
+                                present: r.last_wait.saturating_sub(r.last_acquire),
+                                // The timer numbered this frame before counting it.
+                                gpu_frame: r.gpu_frames().map(|n| n.saturating_sub(1)),
+                                spans: horizon_client::spans::describe(&spans),
+                            });
                     }
                     if let Some(r) = self.renderer.as_mut() {
                         let cpu = now.elapsed().saturating_sub(r.last_wait);
@@ -12380,7 +12398,7 @@ impl ApplicationHandler for Game<'_> {
                             self.frame_graph.record(
                                 ms(elapsed),
                                 ms(cpu),
-                                r.gpu_times.last().copied(),
+                                r.gpu_times.last().map(|&(_, gpu)| gpu),
                             );
                             self.frame_stats.record_cpu(ms(cpu));
                             let render = r.last_encode;
@@ -12391,7 +12409,17 @@ impl ApplicationHandler for Game<'_> {
                                 ms(render),
                             ]);
                         }
-                        self.frame_stats.record_gpu(&r.gpu_times);
+                        // A frame waits for the GPU work of the frames before
+                        // it: their slow GPU times, against the flight frames.
+                        if let Some(threshold) = self.options.spikes
+                            && self.flight.as_ref().is_some_and(|f| f.raw)
+                        {
+                            for &(n, gpu) in r.gpu_times.iter().filter(|g| g.1 > threshold / 2.0) {
+                                log::info!("Horizon: slow gpu frame #{n} {gpu:.1} ms");
+                            }
+                        }
+                        let gpu: Vec<f32> = r.gpu_times.iter().map(|&(_, gpu)| gpu).collect();
+                        self.frame_stats.record_gpu(&gpu);
                         r.gpu_times.clear();
                     }
                     self.limit_frame();
