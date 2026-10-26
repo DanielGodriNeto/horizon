@@ -146,6 +146,11 @@ pub struct Frames {
     pub max_ms: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_p50_ms: Option<f64>,
+    /// The slow tail of the CPU part of frames, without the GPU wait (acquire and present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_p99_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_p999_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_p50_ms: Option<f64>,
     /// Frame counts per bucket of [`HISTOGRAM_EDGES_MS`].
@@ -168,6 +173,8 @@ impl Frames {
             return None;
         }
         let total: f64 = times.iter().sum();
+        let cpu = sorted(cpu_ms);
+        let cpu_at = |p: f64| (!cpu.is_empty()).then(|| round(percentile(&cpu, p)));
         // The average frame time of the slowest `share` of frames, as frames per second.
         let low = |share: f64| {
             let slowest = &times[n - ((n as f64 * share).ceil() as usize).max(1)..];
@@ -190,7 +197,9 @@ impl Frames {
             p99_ms: round(percentile(&times, 0.99)),
             p999_ms: round(percentile(&times, 0.999)),
             max_ms: round(times[n - 1]),
-            cpu_p50_ms: (!cpu_ms.is_empty()).then(|| round(percentile(&sorted(cpu_ms), 0.5))),
+            cpu_p50_ms: cpu_at(0.5),
+            cpu_p99_ms: cpu_at(0.99),
+            cpu_p999_ms: cpu_at(0.999),
             gpu_p50_ms: (!gpu_ms.is_empty()).then(|| round(percentile(&sorted(gpu_ms), 0.5))),
             histogram,
         })
@@ -403,7 +412,21 @@ mod tests {
         assert_eq!(f.histogram[23], 1, "1500 ms falls in [1000, inf)");
         assert_eq!(f.histogram.iter().sum::<u64>(), 1000);
         assert_eq!((f.cpu_p50_ms, f.gpu_p50_ms), (None, None));
+        assert_eq!((f.cpu_p99_ms, f.cpu_p999_ms), (None, None));
         assert_eq!(Frames::of("x", 0, &[], &[], &[]), None);
+    }
+
+    #[test]
+    fn cpu_tail_percentiles() {
+        // CPU times 1..=1000 ms in reverse order: nearest rank.
+        let cpu: Vec<f32> = (1..=1000).rev().map(|v| v as f32).collect();
+        let f = Frames::of("flight", 0, &[2.0; 1000], &cpu, &[]).unwrap();
+        assert_eq!(f.cpu_p50_ms, Some(500.0));
+        assert_eq!(f.cpu_p99_ms, Some(990.0));
+        assert_eq!(f.cpu_p999_ms, Some(999.0));
+        // Non-finite samples are dropped, as for frame times.
+        let f = Frames::of("flight", 0, &[2.0], &[f32::NAN, 3.0], &[]).unwrap();
+        assert_eq!((f.cpu_p50_ms, f.cpu_p99_ms), (Some(3.0), Some(3.0)));
     }
 
     #[test]
