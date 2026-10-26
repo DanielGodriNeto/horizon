@@ -180,7 +180,7 @@ impl Arena {
             let current = page.capacity;
             let grown = (current * 2).max(current + len).min(self.page_limit);
             if (grown - current >= len || grown == self.page_limit)
-                && self.grow(device, encoder, last, grown)
+                && crate::spans::time("arena_grow", || self.grow(device, encoder, last, grown))
                 && let Some(start) = self.pages[last].as_mut().unwrap().free.take(len)
             {
                 return Some((last as u32, start));
@@ -194,7 +194,8 @@ impl Arena {
         .max(len)
         .min(self.page_limit);
         // A page just large enough when memory is short.
-        let (buffer, capacity) = match self.create(device, capacity) {
+        let created = crate::spans::time("arena_page", || self.create(device, capacity));
+        let (buffer, capacity) = match created {
             Some(buffer) => (buffer, capacity),
             None if capacity > len => (self.create(device, len)?, len),
             None => return None,
@@ -248,13 +249,27 @@ impl Arena {
         true
     }
     /// Reclaim after an upload batch, so replacing a section can reuse its range.
+    /// The largest empty page stays: a teleport empties every page, and
+    /// creating and growing them again for the next area took ~10 ms frames.
+    // ponytail: one spare page (up to PAGE_BYTES of video memory); release it
+    // under memory pressure if spilling to system memory ever shows up.
     pub fn trim(&mut self) {
-        for page in &mut self.pages {
-            if let Some(p) = page
-                && p.free.0.len() == 1
-                && p.free.0.get(&0) == Some(&p.capacity)
-            {
-                *page = None;
+        let mut spare: Option<usize> = None;
+        for i in 0..self.pages.len() {
+            let Some(p) = &self.pages[i] else { continue };
+            if !(p.free.0.len() == 1 && p.free.0.get(&0) == Some(&p.capacity)) {
+                continue;
+            }
+            let capacity = p.capacity;
+            match spare {
+                Some(s) if self.pages[s].as_ref().unwrap().capacity >= capacity => {
+                    self.pages[i] = None;
+                }
+                Some(s) => {
+                    self.pages[s] = None;
+                    spare = Some(i);
+                }
+                None => spare = Some(i),
             }
         }
         // Keep live page indices stable; later allocations reuse interior holes.
@@ -367,7 +382,8 @@ mod tests {
         assert_eq!(arena.bytes(), 4 * GRAIN * 4);
         arena.release(first, b, GRAIN);
         arena.trim();
-        assert_eq!(arena.bytes(), 2 * GRAIN * 4);
+        // The only empty page is kept as the spare.
+        assert_eq!(arena.bytes(), 4 * GRAIN * 4);
         assert_eq!(arena.buffer(live), &buffer);
         let (reused, d) = alloc(&mut arena, &device, &queue, GRAIN).unwrap();
         assert_eq!(reused, first);
@@ -384,8 +400,14 @@ mod tests {
         arena.release(reused, d, GRAIN);
         arena.release(live, c, 2 * GRAIN);
         arena.trim();
+        // Of two empty pages one is released, the other kept for the next
+        // allocations, which need no new page.
+        assert_eq!(arena.bytes(), 2 * GRAIN * 4);
+        assert_eq!(arena.pages.iter().flatten().count(), 1);
+        alloc(&mut arena, &device, &queue, 2 * GRAIN).unwrap();
+        assert_eq!(arena.bytes(), 2 * GRAIN * 4);
+        arena.clear();
         assert_eq!(arena.bytes(), 0);
-        assert!(arena.pages.is_empty());
     }
 
     #[test]
