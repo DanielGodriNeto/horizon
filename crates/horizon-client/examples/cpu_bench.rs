@@ -11,7 +11,12 @@
 //! Each round starts from a fresh generator, so caches it fills (structure
 //! starts, noise) are cold every time, as for a newly explored area. A first
 //! uncounted round warms the process up. The summary gives each stage's
-//! median CPU time, and its spread (max - min) over the median.
+//! fastest and median CPU time, and its spread (max - min) over the median.
+//! On a machine in use, a busy neighbour slows a whole round at once, so the
+//! fastest round is the steadier figure to compare builds by. Under
+//! `gen_proto` it splits the generator's own stage timings (wall time, which
+//! on one thread is CPU time unless the thread was preempted), and under
+//! `relight` the light spans.
 use horizon_client::{
     assets::Assets,
     biome::Biomes,
@@ -62,7 +67,7 @@ fn generate(
     terrain: &VanillaTerrain,
     center: (i32, i32),
     radius: i32,
-    times: &mut [Duration; 3],
+    times: &mut [Duration; 8],
 ) -> Result<Columns, Error> {
     let mut worker = terrain.worker();
     let mut protos: HashMap<(i32, i32), Proto> = HashMap::new();
@@ -74,6 +79,16 @@ fn generate(
     })?;
     protos.extend(made);
     times[0] += t;
+    let stages = worker.stage_timings();
+    for (slot, d) in times[3..].iter_mut().zip([
+        stages.biomes,
+        stages.noise,
+        stages.surface,
+        stages.structures,
+        stages.carvers,
+    ]) {
+        *slot += d;
+    }
     for (x, z) in square(center, radius + 1) {
         let keys: [(i32, i32); 9] =
             std::array::from_fn(|i| (x + i as i32 % 3 - 1, z + i as i32 / 3 - 1));
@@ -151,20 +166,29 @@ fn main() -> Result<(), Error> {
 
     let names = [
         "gen_proto",
+        "  biomes",
+        "  noise",
+        "  surface",
+        "  structures",
+        "  carvers",
         "gen_decorate",
         "gen_finish",
         "light",
         "relight",
+        "  lt_block",
+        "  lt_columns",
+        "  lt_sky",
         "mesh",
     ];
     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
     let mut sums = [0u64; 4];
+    horizon_client::spans::enable(true);
     let lit_keys = square(center, radius - 1);
     let mesh_keys = square(center, radius - 2);
     // Round 0 warms up the process (page faults, lazy tables) and is not counted.
     for round in 0..=rounds.max(1) {
         let terrain = VanillaTerrain::new(&root.join("worldgen"), assets.registry, &biomes, seed)?;
-        let mut gen_times = [Duration::ZERO; 3];
+        let mut gen_times = [Duration::ZERO; 8];
         let mut columns = generate(&terrain, center, radius, &mut gen_times)?;
         let mut hash = DefaultHasher::new();
         for key in square(center, radius) {
@@ -201,6 +225,7 @@ fn main() -> Result<(), Error> {
             state % n
         };
         let mut relight_time = Duration::ZERO;
+        horizon_client::spans::take();
         for _ in 0..edits {
             let (cx, cz) = mesh_keys[next(mesh_keys.len() as u64) as usize];
             let (lx, lz) = (next(16) as i32, next(16) as i32);
@@ -224,6 +249,14 @@ fn main() -> Result<(), Error> {
         let mut hash = DefaultHasher::new();
         hash_light(&columns, &lit_keys, &mut hash);
         let relight_sum = hash.finish();
+        let spans = horizon_client::spans::take();
+        let span = |name: &str| {
+            spans
+                .iter()
+                .filter(|s| s.name == name)
+                .map(|s| Duration::from_secs_f32(s.cpu_ms / 1e3))
+                .sum::<Duration>()
+        };
 
         // Every section of the inner columns, as the mesh workers do.
         let mut mesher = Mesher {
@@ -260,10 +293,18 @@ fn main() -> Result<(), Error> {
 
         let times = [
             gen_times[0],
+            gen_times[3],
+            gen_times[4],
+            gen_times[5],
+            gen_times[6],
+            gen_times[7],
             gen_times[1],
             gen_times[2],
             light_time,
             relight_time,
+            span("lt_block"),
+            span("lt_columns"),
+            span("lt_sky"),
             mesh_time,
         ];
         if round > 0 {
@@ -283,16 +324,26 @@ fn main() -> Result<(), Error> {
             names
                 .iter()
                 .zip(times)
+                .filter(|(n, _)| !n.starts_with(' '))
                 .map(|(n, t)| format!("{n} {:.1}", t.as_secs_f64() * 1e3))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
     }
+    let proto = ("column", square(center, radius + 2).len());
     let units = [
-        ("column", square(center, radius + 2).len()),
+        proto,
+        proto,
+        proto,
+        proto,
+        proto,
+        proto,
         ("column", square(center, radius + 1).len()),
         ("column", square(center, radius).len()),
         ("column", lit_keys.len()),
+        ("edit", edits),
+        ("edit", edits),
+        ("edit", edits),
         ("edit", edits),
         ("section", mesh_keys.len() * HEIGHT as usize / 16),
     ];
@@ -303,9 +354,14 @@ fn main() -> Result<(), Error> {
     for ((name, s), (unit, n)) in names.iter().zip(&mut samples).zip(units) {
         s.sort_by(f64::total_cmp);
         let median = s[s.len() / 2];
-        let spread = (s[s.len() - 1] - s[0]) / median * 100.0;
+        let spread = if median > 0.0 {
+            (s[s.len() - 1] - s[0]) / median * 100.0
+        } else {
+            0.0
+        };
         println!(
-            "stage {name:<13} median {median:9.2} ms  spread {spread:5.1} %  {:8.4} ms/{unit}",
+            "stage {name:<13} min {:9.2} ms  median {median:9.2} ms  spread {spread:5.1} %  {:8.4} ms/{unit}",
+            s[0],
             median / n.max(1) as f64
         );
     }
