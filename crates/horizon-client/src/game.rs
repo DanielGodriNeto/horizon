@@ -1310,6 +1310,10 @@ struct Game<'a> {
     scope_scale: f32,
     /// Duration of the last frame in ticks (GUI easing).
     frame_ticks: f32,
+    /// With `HORIZON_SPIKES` during a measured flight: the last frame's wall
+    /// time, its GPU wait and its spans, logged when the time to the next
+    /// frame (what the benchmark counts) is slow.
+    flight_frame: Option<(Duration, Duration, String)>,
     title: Option<Title>,
     /// Armor slots: head, chest, legs, feet.
     armor: [Option<ItemStack>; 4],
@@ -11409,6 +11413,19 @@ impl ApplicationHandler for Game<'_> {
                         .spikes
                         .and_then(|_| horizon_client::spans::thread_cpu());
                     let elapsed = now.duration_since(self.previous);
+                    if let Some(threshold) = self.options.spikes
+                        && let Some((wall, wait, spans)) = self.flight_frame.take()
+                        && elapsed.as_secs_f32() * 1000.0 > threshold
+                    {
+                        let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+                        log::info!(
+                            "Horizon: slow flight frame {:.1} ms: frame {:.1} ms (gpu wait {:.1}), between frames {:.1}: {spans}",
+                            ms(elapsed),
+                            ms(wall),
+                            ms(wait),
+                            ms(elapsed.saturating_sub(wall))
+                        );
+                    }
                     self.frame_ticks = elapsed.as_secs_f32() * 20.0;
                     self.previous = now;
                     // Arrow-key camera controls belong to gameplay; chat and
@@ -11494,6 +11511,9 @@ impl ApplicationHandler for Game<'_> {
                                 horizon_client::spans::describe(&spans)
                             );
                         }
+                        self.flight_frame = self.flight.as_ref().is_some_and(|f| f.raw).then(|| {
+                            (now.elapsed(), r.last_wait, horizon_client::spans::describe(&spans))
+                        });
                     }
                     if let Some(r) = self.renderer.as_mut() {
                         let cpu = now.elapsed().saturating_sub(r.last_wait);
@@ -11853,6 +11873,7 @@ impl<'a> Game<'a> {
             frame_clock: Default::default(),
             scope_scale: 0.5,
             frame_ticks: 0.0,
+            flight_frame: None,
             title: None,
             armor: [None, None, None, None],
             offhand: None,
