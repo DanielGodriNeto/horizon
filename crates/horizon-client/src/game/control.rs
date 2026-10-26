@@ -58,7 +58,7 @@ pub struct Flight {
     started: Instant,
     seconds: f64,
     /// Reply with every frame time too (`fly ... PITCH raw`).
-    raw: bool,
+    pub(super) raw: bool,
     reply: Sender<String>,
     /// The world's smoothed tick time each frame (the F3 server line): the
     /// server thread's when single player runs on one.
