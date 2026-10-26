@@ -2709,20 +2709,22 @@ impl Renderer {
         self.occlusion.update(camera, (distance / 16.0) as i32 + 2);
     }
     pub fn upload(&mut self, key: SectionKey, mesh: &SectionMesh) {
-        self.occlusion.set(key, mesh.visibility);
-        let changed = if mesh.block_entities.is_empty() {
-            self.block_entities.remove(&key).is_some()
-        } else {
-            let old = self.block_entities.insert(key, mesh.block_entities.clone());
-            old.as_deref() != Some(&mesh.block_entities[..])
-        };
-        if changed {
-            self.block_entity_revision = next_block_entity_revision();
-        }
-        if !self.lod_retiring.is_empty() {
-            self.lod_retiring.remove(&key);
-        }
-        self.release_section(key);
+        crate::spans::time("up_meta", || {
+            self.occlusion.set(key, mesh.visibility);
+            let changed = if mesh.block_entities.is_empty() {
+                self.block_entities.remove(&key).is_some()
+            } else {
+                let old = self.block_entities.insert(key, mesh.block_entities.clone());
+                old.as_deref() != Some(&mesh.block_entities[..])
+            };
+            if changed {
+                self.block_entity_revision = next_block_entity_revision();
+            }
+            if !self.lod_retiring.is_empty() {
+                self.lod_retiring.remove(&key);
+            }
+        });
+        crate::spans::time("up_release", || self.release_section(key));
         let section = self.upload_mesh(mesh);
         self.set_detail(
             key,
@@ -2751,7 +2753,8 @@ impl Renderer {
                 })
         });
         // With video and system memory both full, the section is not drawn.
-        let (page, start) = self.arena.alloc(&self.device, encoder, vertices)?;
+        let (page, start) =
+            crate::spans::time("up_alloc", || self.arena.alloc(&self.device, encoder, vertices))?;
         let sorted_indices = if translucent > 0 {
             let indices =
                 self.sorted_indices
@@ -2775,24 +2778,36 @@ impl Renderer {
             )
         });
         let stride = std::mem::size_of::<TerrainVertex>() as u64;
-        for (offset, part) in [(0, &mesh.solid), (mesh.solid.len(), &mesh.translucent)] {
-            if !part.is_empty() {
-                let bytes: &[u8] = bytemuck::cast_slice(part);
-                self.uploaded_bytes += bytes.len() as u64;
-                self.section_copy_bytes += bytes.len() as u64;
-                self.section_uploads.buffer(
-                    encoder,
-                    self.arena.buffer(page),
-                    (start + offset as u64) * stride,
-                    bytes,
-                );
+        crate::spans::time("up_copy", || {
+            for (offset, part) in [(0, &mesh.solid), (mesh.solid.len(), &mesh.translucent)] {
+                if !part.is_empty() {
+                    let bytes: &[u8] = bytemuck::cast_slice(part);
+                    self.uploaded_bytes += bytes.len() as u64;
+                    self.section_copy_bytes += bytes.len() as u64;
+                    self.section_uploads.buffer(
+                        encoder,
+                        self.arena.buffer(page),
+                        (start + offset as u64) * stride,
+                        bytes,
+                    );
+                }
             }
-        }
+        });
         if self.section_copy_bytes >= SECTION_COPY_LIMIT
             && let Some(copies) = self.take_section_copies()
         {
-            self.queue.submit([copies]);
+            crate::spans::time("up_submit", || self.queue.submit([copies]));
         }
+        let sort = crate::spans::time("up_sort", || {
+            translucency::SortState::new(
+                mesh.translucent
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|q| translucency::quad_center(q[0].pos, q[2].pos))
+                    .collect(),
+            )
+        });
         Some(SectionGpu {
             page,
             start,
@@ -2803,14 +2818,7 @@ impl Renderer {
                 Sides::unsorted(solid)
             },
             translucent,
-            sort: translucency::SortState::new(
-                mesh.translucent
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|q| translucency::quad_center(q[0].pos, q[2].pos))
-                    .collect(),
-            ),
+            sort,
             sorted_indices,
             flat_id,
         })

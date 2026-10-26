@@ -863,7 +863,7 @@ impl Streaming {
         }
         ExtraCover::refresh(&mut self.cover, &self.extra);
         self.requeue();
-        self.relight_edits(world);
+        crate::spans::time("st_relight", || self.relight_edits(world));
         let deferred = std::mem::take(&mut self.deferred);
         let received = std::iter::from_fn(|| self.results.try_recv().ok());
         for done in deferred.into_iter().chain(received.collect::<Vec<_>>()) {
@@ -879,41 +879,45 @@ impl Streaming {
                     }
                 }
                 Done::Decorated(x, z, region) => self.receive_decorated(x, z, *region),
-                Done::Generated(chunk) => self.receive_generated(chunk, world),
+                Done::Generated(chunk) => {
+                    crate::spans::time("st_generated", || self.receive_generated(chunk, world));
+                }
                 Done::Saved(protos) => self.receive_saved(protos),
                 Done::Lit(x, z, sections, seq) => {
                     if self.lighting.get(&(x, z)) != Some(&seq) {
                         continue;
                     }
-                    self.lighting.remove(&(x, z));
-                    let snapshot = self.light_snapshots.remove(&(x, z)).unwrap_or(u64::MAX);
-                    if let Some(chunk) = world.chunks.get_mut(&(x, z)) {
-                        let chunk = Arc::make_mut(chunk);
-                        // Keep blocks edited since the snapshot; take only light.
-                        // A chunk relit (a neighbour loaded or changed) remeshes
-                        // only around the light that changed, as vanilla's light
-                        // updates dirty only their sections (#270).
-                        let first = self.lit.insert((x, z));
-                        let mut changed = LightChanges::default();
-                        if first {
-                            apply_lighting(chunk, sections);
-                        } else {
-                            apply_relighting(chunk, sections, &mut changed);
-                        }
-                        chunk.lit = true;
-                        if first {
-                            for dz in -1..=1 {
-                                for dx in -1..=1 {
-                                    for sy in 0..SECTIONS as i32 {
-                                        world.dirty_sections.insert((x + dx, sy, z + dz));
+                    crate::spans::time("st_lit", || {
+                        self.lighting.remove(&(x, z));
+                        let snapshot = self.light_snapshots.remove(&(x, z)).unwrap_or(u64::MAX);
+                        if let Some(chunk) = world.chunks.get_mut(&(x, z)) {
+                            let chunk = Arc::make_mut(chunk);
+                            // Keep blocks edited since the snapshot; take only light.
+                            // A chunk relit (a neighbour loaded or changed) remeshes
+                            // only around the light that changed, as vanilla's light
+                            // updates dirty only their sections (#270).
+                            let first = self.lit.insert((x, z));
+                            let mut changed = LightChanges::default();
+                            if first {
+                                apply_lighting(chunk, sections);
+                            } else {
+                                apply_relighting(chunk, sections, &mut changed);
+                            }
+                            chunk.lit = true;
+                            if first {
+                                for dz in -1..=1 {
+                                    for dx in -1..=1 {
+                                        for sy in 0..SECTIONS as i32 {
+                                            world.dirty_sections.insert((x + dx, sy, z + dz));
+                                        }
                                     }
                                 }
+                            } else {
+                                Self::mark_light_changes(world, &changed);
                             }
-                        } else {
-                            Self::mark_light_changes(world, &changed);
+                            self.replay_light_edits(world, x, z, snapshot);
                         }
-                        self.replay_light_edits(world, x, z, snapshot);
-                    }
+                    });
                 }
                 Done::Meshed(x, sy, z, mesh, seq) => {
                     if self.meshing.get(&(x, sy, z)) != Some(&seq) {
@@ -932,33 +936,36 @@ impl Streaming {
             }
         }
         // Unload far columns.
-        let far: Vec<_> = world
-            .chunks
-            .keys()
-            .copied()
-            .filter(|&(x, z)| !self.remote && self.ranges().unloaded(x, z, self.decorates))
-            .collect();
-        for key in &far {
-            self.decorated.remove(key);
-        }
-        let mut removed = Vec::with_capacity(far.len());
-        for key in &far {
-            if let Some(chunk) = world.chunks.remove(key) {
-                removed.push(chunk);
+        let removed = crate::spans::time("st_unload", || {
+            let far: Vec<_> = world
+                .chunks
+                .keys()
+                .copied()
+                .filter(|&(x, z)| !self.remote && self.ranges().unloaded(x, z, self.decorates))
+                .collect();
+            for key in &far {
+                self.decorated.remove(key);
             }
-            self.lit.remove(key);
-            self.meshed.remove(key);
-            self.lighting.remove(key);
-            self.light_snapshots.remove(key);
-        }
-        if !far.is_empty() {
-            let far: HashSet<(i32, i32)> = far.iter().copied().collect();
-            self.meshing.retain(|k, _| !far.contains(&(k.0, k.2)));
-            self.waiting.retain(|k| !far.contains(&(k.0, k.2)));
-            world
-                .dirty_sections
-                .retain_columns(|x, z| !far.contains(&(x, z)));
-        }
+            let mut removed = Vec::with_capacity(far.len());
+            for key in &far {
+                if let Some(chunk) = world.chunks.remove(key) {
+                    removed.push(chunk);
+                }
+                self.lit.remove(key);
+                self.meshed.remove(key);
+                self.lighting.remove(key);
+                self.light_snapshots.remove(key);
+            }
+            if !far.is_empty() {
+                let far: HashSet<(i32, i32)> = far.iter().copied().collect();
+                self.meshing.retain(|k, _| !far.contains(&(k.0, k.2)));
+                self.waiting.retain(|k| !far.contains(&(k.0, k.2)));
+                world
+                    .dirty_sections
+                    .retain_columns(|x, z| !far.contains(&(x, z)));
+            }
+            removed
+        });
         // Drop far proto chunks that are not checked out.
         let (center, r4) = (self.center, i64::from(self.radius + 4));
         let ranges = self.ranges();
