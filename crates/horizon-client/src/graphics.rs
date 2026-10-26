@@ -250,9 +250,6 @@ pub struct Graphics {
     /// or behind other windows, and half the worker threads. Off by default;
     /// it changes when frames are drawn, never what they show or the ticks.
     pub battery: bool,
-    /// Turbo: with both upload budgets at 0, spreads mesh uploads over frames
-    /// (12 sections, 4096 KiB each). Off by default; changes timing only.
-    pub turbo: bool,
     /// The graphics API (Windows only; see `GraphicsApi`).
     pub api: GraphicsApi,
 }
@@ -277,7 +274,6 @@ impl Default for Graphics {
             resolution_scale: 100,
             fxaa: false,
             battery: false,
-            turbo: false,
             api: GraphicsApi::Auto,
         }
     }
@@ -328,7 +324,6 @@ impl Graphics {
                 "resolutionScale" => g.resolution_scale = number(g.resolution_scale).clamp(50, 200),
                 "fxaa" => g.fxaa = flag(g.fxaa),
                 "batteryMode" => g.battery = flag(g.battery),
-                "turbo" => g.turbo = flag(g.turbo),
                 "graphicsApi" => g.api = GraphicsApi::from_name(value).unwrap_or_default(),
                 "overlay" => {
                     g.overlay = match value {
@@ -344,7 +339,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\nbatteryMode:{}\nturbo:{}\ngraphicsApi:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\nbatteryMode:{}\ngraphicsApi:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -370,7 +365,6 @@ impl Graphics {
             self.resolution_scale,
             bool_text(self.fxaa),
             bool_text(self.battery),
-            bool_text(self.turbo),
             self.api.name(),
         )
     }
@@ -463,7 +457,6 @@ mod tests {
             resolution_scale: 75,
             fxaa: true,
             battery: true,
-            turbo: true,
             api: GraphicsApi::Dx12,
         };
         assert_eq!(Graphics::parse(&g.serialize()), g);
@@ -561,17 +554,6 @@ mod tests {
         // A manual count is the player's own choice, kept as asked.
         let manual = Graphics { workers: 3, ..g };
         assert_eq!(manual.worker_threads(), 3);
-    }
-
-    #[test]
-    fn turbo_is_off_by_default_and_round_trips() {
-        assert!(!Graphics::default().turbo);
-        let on = Graphics {
-            turbo: true,
-            ..Graphics::default()
-        };
-        assert_eq!(Graphics::parse(&on.serialize()), on);
-        assert!(!Graphics::parse("turbo:maybe\n").turbo);
     }
 
     #[test]

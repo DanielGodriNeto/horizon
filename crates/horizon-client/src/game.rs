@@ -10650,14 +10650,7 @@ impl Game<'_> {
         }
         if let Some(renderer) = self.renderer.as_mut() {
             let g = &self.settings.horizon;
-            // Turbo with both budgets at 0 turns on a default budget.
-            let (chunk_updates, upload_budget_kib) =
-                if g.turbo && g.chunk_updates == 0 && g.upload_budget_kib == 0 {
-                    (12, 4096)
-                } else {
-                    (g.chunk_updates, g.upload_budget_kib)
-                };
-            let budgeted = chunk_updates > 0 || upload_budget_kib > 0;
+            let budgeted = g.chunk_updates > 0 || g.upload_budget_kib > 0;
             if !budgeted && self.pending_uploads.is_empty() {
                 horizon_client::spans::time("upload", || {
                     for (key, mesh) in uploads {
@@ -10683,27 +10676,28 @@ impl Game<'_> {
                 let far = |k: &(i32, i32, i32)| (k.0 - centre.0).pow(2) + (k.2 - centre.1).pow(2);
                 pending.sort_unstable_by_key(|(k, _)| std::cmp::Reverse(far(k)));
                 let (limit, budget) = if budgeted {
-                    (chunk_updates as usize, u64::from(upload_budget_kib) * 1024)
+                    (
+                        g.chunk_updates as usize,
+                        u64::from(g.upload_budget_kib) * 1024,
+                    )
                 } else {
                     (0, 0)
                 };
                 let (mut count, mut bytes) = (0, 0u64);
-                horizon_client::spans::time("upload_budgeted", || {
-                    while let Some((_, mesh)) = pending.last() {
-                        let size = ((mesh.solid.len() + mesh.translucent.len())
-                            * std::mem::size_of::<horizon_client::mesher::TerrainVertex>())
-                            as u64;
-                        if (limit > 0 && count >= limit)
-                            || (budget > 0 && bytes > 0 && bytes + size > budget)
-                        {
-                            break;
-                        }
-                        let (key, mesh) = pending.pop().expect("checked above");
-                        renderer.upload(key, &mesh);
-                        count += 1;
-                        bytes += size;
+                while let Some((_, mesh)) = pending.last() {
+                    let size = ((mesh.solid.len() + mesh.translucent.len())
+                        * std::mem::size_of::<horizon_client::mesher::TerrainVertex>())
+                        as u64;
+                    if (limit > 0 && count >= limit)
+                        || (budget > 0 && bytes > 0 && bytes + size > budget)
+                    {
+                        break;
                     }
-                });
+                    let (key, mesh) = pending.pop().expect("checked above");
+                    renderer.upload(key, &mesh);
+                    count += 1;
+                    bytes += size;
+                }
             }
             for c in unloaded {
                 for sy in 0..(HEIGHT / 16) {
