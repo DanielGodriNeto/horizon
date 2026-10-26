@@ -10580,7 +10580,7 @@ impl Game<'_> {
         }
     }
     fn update_world(&mut self) {
-        if let Err(e) = horizon_client::spans::time("poll_remote", || self.poll_remote()) {
+        if let Err(e) = self.poll_remote() {
             log::warn!("Horizon: {e}");
         }
         self.prepare_lod();
@@ -10699,13 +10699,11 @@ impl Game<'_> {
                     bytes += size;
                 }
             }
-            horizon_client::spans::time("unload_sections", || {
-                for c in unloaded {
-                    for sy in 0..(HEIGHT / 16) {
-                        renderer.remove((c.x, sy, c.z));
-                    }
+            for c in unloaded {
+                for sy in 0..(HEIGHT / 16) {
+                    renderer.remove((c.x, sy, c.z));
                 }
-            });
+            }
             if let (Some(lod), Some(player)) = (&mut self.lod, &self.player) {
                 let lod_distance = self.settings.horizon.lod_distance_on(&renderer.info);
                 lod.set_near_loading(self.streaming.busy());
