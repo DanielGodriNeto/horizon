@@ -12382,14 +12382,17 @@ impl ApplicationHandler for Game<'_> {
                             );
                         }
                         self.flight_frame =
-                            self.flight.as_ref().is_some_and(|f| f.raw).then(|| FlightFrame {
-                                wall: now.elapsed(),
-                                acquire: r.last_acquire,
-                                present: r.last_wait.saturating_sub(r.last_acquire),
-                                // The timer numbered this frame before counting it.
-                                gpu_frame: r.gpu_frames().map(|n| n.saturating_sub(1)),
-                                spans: horizon_client::spans::describe(&spans),
-                            });
+                            self.flight
+                                .as_ref()
+                                .is_some_and(|f| f.raw)
+                                .then(|| FlightFrame {
+                                    wall: now.elapsed(),
+                                    acquire: r.last_acquire,
+                                    present: r.last_wait.saturating_sub(r.last_acquire),
+                                    // The timer numbered this frame before counting it.
+                                    gpu_frame: r.gpu_frames().map(|n| n.saturating_sub(1)),
+                                    spans: horizon_client::spans::describe(&spans),
+                                });
                     }
                     if let Some(r) = self.renderer.as_mut() {
                         let cpu = now.elapsed().saturating_sub(r.last_wait);

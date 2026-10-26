@@ -572,7 +572,9 @@ pub trait LightWorld {
 }
 impl<S: std::hash::BuildHasher> LightWorld for HashMap<(i32, i32), Arc<Chunk>, S> {
     fn section(&self, cx: i32, s: usize, cz: i32) -> Option<&Arc<Section>> {
-        self.get(&(cx, cz)).filter(|c| c.lit).map(|c| &c.sections[s])
+        self.get(&(cx, cz))
+            .filter(|c| c.lit)
+            .map(|c| &c.sections[s])
     }
     fn set_section_light(&mut self, cx: i32, s: usize, cz: i32, light: Light) {
         if let Some(chunk) = self.get_mut(&(cx, cz)) {
@@ -685,7 +687,8 @@ impl<'w> Region<'w> {
             // Drop the clone first so the world's section isn't copied.
             drop(slot.section);
             let (cx, s, cz) = slot.key;
-            self.world.set_section_light(cx, s as usize, cz, Light::Full(light));
+            self.world
+                .set_section_light(cx, s as usize, cz, Light::Full(light));
         }
     }
 }
@@ -860,7 +863,9 @@ fn relight_region(
                 }
             }
         });
-        crate::spans::time("lt_sky", || relight_layer(world, tables, true, seeds, force, changed));
+        crate::spans::time("lt_sky", || {
+            relight_layer(world, tables, true, seeds, force, changed)
+        });
     }
 }
 fn relight_layer(
@@ -1055,14 +1060,32 @@ mod tests {
         Arc::make_mut(w.get_mut(&(1, 0)).unwrap()).lit = false;
         let before = w.clone();
         let same = |w: &HashMap<(i32, i32), Arc<Chunk>>, key| {
-            w[&key].sections.iter().zip(&before[&key].sections).all(|(a, b)| Arc::ptr_eq(a, b))
+            w[&key]
+                .sections
+                .iter()
+                .zip(&before[&key].sections)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
         };
         // Cleared and lit back to the same values: nothing is stored.
-        relight(&mut w, &tables(), true, &[(8, 5, 8)], false, &mut LightChanges::default());
+        relight(
+            &mut w,
+            &tables(),
+            true,
+            &[(8, 5, 8)],
+            false,
+            &mut LightChanges::default(),
+        );
         assert!(w.keys().all(|&key| same(&w, key)));
         // Light reaching an unlit chunk isn't written into it.
         Arc::make_mut(w.get_mut(&(0, 0)).unwrap()).set(15, 0, 8, TORCH);
-        relight(&mut w, &tables(), true, &[(15, 0, 8)], false, &mut LightChanges::default());
+        relight(
+            &mut w,
+            &tables(),
+            true,
+            &[(15, 0, 8)],
+            false,
+            &mut LightChanges::default(),
+        );
         assert!(same(&w, (1, 0)));
         assert_eq!(block(&w, 14, 0, 8), 13);
     }
@@ -1080,7 +1103,18 @@ mod tests {
             rng as usize % n
         };
         let xz = [-2, -1, 0, 1, 7, 14, 15, 16, 17];
-        let ys = [MIN_Y, MIN_Y + 1, -2, -1, 0, 1, 15, 16, MIN_Y + HEIGHT - 2, MIN_Y + HEIGHT - 1];
+        let ys = [
+            MIN_Y,
+            MIN_Y + 1,
+            -2,
+            -1,
+            0,
+            1,
+            15,
+            16,
+            MIN_Y + HEIGHT - 2,
+            MIN_Y + HEIGHT - 1,
+        ];
         for _ in 0..60 {
             let positions: Vec<Pos> = (0..1 + next(6))
                 .map(|_| (xz[next(xz.len())], ys[next(ys.len())], xz[next(xz.len())]))
@@ -1089,17 +1123,31 @@ mod tests {
                 let state = [TORCH, SLAB, AIR, STONE][next(4)];
                 Arc::make_mut(w.get_mut(&(x >> 4, z >> 4)).unwrap()).set(x & 15, y, z & 15, state);
             }
-            relight(&mut w, &tables(), true, &positions, false, &mut LightChanges::default());
+            relight(
+                &mut w,
+                &tables(),
+                true,
+                &positions,
+                false,
+                &mut LightChanges::default(),
+            );
         }
         // Every chunk, the outer ring lit as `world` lit it (no neighbours
         // past the 3x3).
         for (&(cx, cz), chunk) in &w {
             let region: [[Option<&Chunk>; 3]; 3] = std::array::from_fn(|dz| {
-                std::array::from_fn(|dx| w.get(&(cx + dx as i32 - 1, cz + dz as i32 - 1)).map(|c| &**c))
+                std::array::from_fn(|dx| {
+                    w.get(&(cx + dx as i32 - 1, cz + dz as i32 - 1))
+                        .map(|c| &**c)
+                })
             });
             for (si, s) in light_chunk(&region, &tables(), true).iter().enumerate() {
                 for i in 0..4096 {
-                    assert_eq!(s.get(i), chunk.sections[si].light(i), "chunk {cx},{cz} section {si} index {i}");
+                    assert_eq!(
+                        s.get(i),
+                        chunk.sections[si].light(i),
+                        "chunk {cx},{cz} section {si} index {i}"
+                    );
                 }
             }
         }
@@ -1501,7 +1549,10 @@ mod tests {
             }
             relight(&mut w, &t, true, &positions, false, &mut changed);
         }
-        println!("relight_bench: {:?}, {} sections", start.elapsed(), changed.sections().count());
+        println!(
+            "relight_bench: {:?}, {} sections",
+            start.elapsed(),
+            changed.sections().count()
+        );
     }
-
 }

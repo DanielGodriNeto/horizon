@@ -103,7 +103,13 @@ mod tests {
         for column in map.values_mut() {
             Arc::make_mut(column).light_loaded = true;
         }
-        crate::light::LightWorld::set_section_light(&mut map, 0, 0, 0, crate::chunk::Light::Uniform(0));
+        crate::light::LightWorld::set_section_light(
+            &mut map,
+            0,
+            0,
+            0,
+            crate::chunk::Light::Uniform(0),
+        );
         assert_eq!(inserted, map.membership_revision());
         map.remove(&(0, 0));
         map.insert((1, 0), chunk);

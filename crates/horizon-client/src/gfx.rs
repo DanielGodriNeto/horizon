@@ -2753,8 +2753,9 @@ impl Renderer {
                 })
         });
         // With video and system memory both full, the section is not drawn.
-        let (page, start) =
-            crate::spans::time("up_alloc", || self.arena.alloc(&self.device, encoder, vertices))?;
+        let (page, start) = crate::spans::time("up_alloc", || {
+            self.arena.alloc(&self.device, encoder, vertices)
+        })?;
         let sorted_indices = if translucent > 0 {
             let indices =
                 self.sorted_indices
