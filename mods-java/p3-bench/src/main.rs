@@ -101,6 +101,11 @@ fn run_host(args: &Args, shared: &Shared, file: &Path, jar: &Path) -> Res<String
     let java_version = report::java_version(&args.java)?;
     let gap = Duration::from_micros(args.gap_us.unwrap_or(1000));
     let mut side = Side::spawn(&args.java, &args.sidecar_cp, file, Some(jar))?;
+    if args.bridge {
+        host::bridge(&mut side, shared)?;
+        host::finish(side, shared)?;
+        return Ok(String::new());
+    }
     let result = host::run(&mut side, shared, args.iters, gap)?;
     host::check_gem(&result.items)?;
     host::finish(side, shared)?;

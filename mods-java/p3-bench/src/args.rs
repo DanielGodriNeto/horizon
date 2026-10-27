@@ -13,6 +13,8 @@ pub struct Args {
     pub out: Option<PathBuf>,
     /// Presente = modo host: mod Java vivo sobre o anel em vez do bench de eco.
     pub host_jar: Option<PathBuf>,
+    /// Com --host-jar: ponte de linhas stdin/stdout para o jogo em vez do bench.
+    pub bridge: bool,
 }
 
 pub fn parse(mut argv: impl Iterator<Item = String>) -> Res<Args> {
@@ -23,7 +25,12 @@ pub fn parse(mut argv: impl Iterator<Item = String>) -> Res<Args> {
     let mut gap_us = None;
     let mut out = None;
     let mut host_jar = None;
+    let mut bridge = false;
     while let Some(flag) = argv.next() {
+        if flag == "--bridge" {
+            bridge = true;
+            continue;
+        }
         let value = argv.next().ok_or_else(|| format!("{flag} sem valor"))?;
         match flag.as_str() {
             "--java" => java = Some(PathBuf::from(value)),
@@ -47,5 +54,6 @@ pub fn parse(mut argv: impl Iterator<Item = String>) -> Res<Args> {
         gap_us,
         out,
         host_jar,
+        bridge,
     })
 }

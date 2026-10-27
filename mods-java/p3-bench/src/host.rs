@@ -51,13 +51,14 @@ fn parse(msg: &[u8], inbox: &mut Inbox) -> Res<()> {
     Ok(())
 }
 
-fn break_event(seq: u64) -> Vec<u8> {
+/// Evento de quebra de bloco `seq` (número do anel) em `pos`.
+fn break_event(seq: u64, pos: [i32; 3], block: &str) -> Vec<u8> {
     let mut m = vec![BLOCK_BREAK];
     m.extend(seq.to_le_bytes());
-    for coord in [seq as i32, 64, -(seq as i32)] {
+    for coord in pos {
         m.extend(coord.to_le_bytes());
     }
-    m.extend(BLOCK.as_bytes());
+    m.extend(block.as_bytes());
     m
 }
 
@@ -67,6 +68,7 @@ struct Session<'a> {
     shared: &'a Shared,
     tail_a: u64,
     head_b: u64,
+    next_seq: u64,
     inbox: Inbox,
 }
 
@@ -77,14 +79,13 @@ impl<'a> Session<'a> {
     }
 
     /// Envia um evento e acorda o Java se ele dorme (adendo v1.1).
-    fn send(&mut self, side: &mut Side, seq: u64) -> Res<()> {
-        let msg = break_event(seq);
+    fn send(&mut self, side: &mut Side, msg: &[u8]) -> Res<()> {
         let tail = self.tail_a;
         wait_until("espaço no anel A", || {
             self.drain()?;
             Ok(self.a.fits(tail, msg.len()))
         })?;
-        self.a.push(&mut self.tail_a, &msg)?;
+        self.a.push(&mut self.tail_a, msg)?;
         self.a.publish_tail(self.tail_a);
         fence(SeqCst);
         if self.shared.sleeping_flag().load(SeqCst) == 1 {
@@ -93,30 +94,72 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// Uma viagem: evento `seq` até a resposta dele. Devolve µs.
-    fn trip(&mut self, side: &mut Side, seq: u64) -> Res<f64> {
-        let start = Instant::now();
-        self.send(side, seq)?;
+    /// Manda o evento e espera a resposta dele (números do anel em sequência). Devolve o texto do mod.
+    fn event(&mut self, side: &mut Side, pos: [i32; 3], block: &str) -> Res<String> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.send(side, &break_event(seq, pos, block))?;
         wait_until("resposta do mod", || {
             self.drain()?;
             Ok(self.inbox.replies.len() as u64 > seq)
         })?;
-        let elapsed = micros(start.elapsed());
         let (got, text) = &self.inbox.replies[seq as usize];
+        if *got != seq {
+            return Err(format!("resposta fora de ordem: veio {got}, esperado {seq}").into());
+        }
+        Ok(text.clone())
+    }
+
+    /// Uma viagem do bench: evento `seq` até a resposta conferida. Devolve µs.
+    fn trip(&mut self, side: &mut Side, seq: u64) -> Res<f64> {
+        let start = Instant::now();
+        let text = self.event(side, [seq as i32, 64, -(seq as i32)], BLOCK)?;
+        let elapsed = micros(start.elapsed());
+        let (got, _) = &self.inbox.replies[seq as usize];
         let want = format!("gem {} {BLOCK} 64", seq + 1);
-        if *got != seq || *text != want {
+        if *got != seq || text != want {
             return Err(format!("resposta {seq}: veio ({got}, {text:?}), esperado {want:?}").into());
         }
         Ok(elapsed)
     }
 }
 
-/// Sobe o sidecar com o mod, lê os registros e mede `iters` eventos espaçados de `gap` (simula o tick).
-pub fn run(side: &mut Side, shared: &Shared, iters: usize, gap: Duration) -> Res<HostResult> {
+/// Espera o sidecar ficar pronto e lê os registros que o mod mandou.
+fn open<'a>(side: &mut Side, shared: &'a Shared) -> Res<(Session<'a>, Vec<ItemReg>)> {
     side.await_ready(shared)?;
-    let mut s = Session { a: shared.ring_a(), b: shared.ring_b(), shared, tail_a: 0, head_b: 0, inbox: Inbox::default() };
+    let mut s = Session { a: shared.ring_a(), b: shared.ring_b(), shared, tail_a: 0, head_b: 0, next_seq: 0, inbox: Inbox::default() };
     s.drain()?;
     let items = std::mem::take(&mut s.inbox.items);
+    Ok((s, items))
+}
+
+/// Ponte de linhas para o jogo (stdin/stdout). Saída: `I <id> <json>` por item, `READY`.
+/// Entrada: `B <seq> <x> <y> <z> <bloco>`; saída: `R <seq> <mensagens>` (quebra de linha vira U+001F). EOF em stdin encerra.
+pub fn bridge(side: &mut Side, shared: &Shared) -> Res<()> {
+    use std::io::{BufRead, Write};
+    let (mut s, items) = open(side, shared)?;
+    let mut out = std::io::stdout().lock();
+    for i in &items {
+        writeln!(out, "I {} {}", i.id, i.json)?;
+    }
+    writeln!(out, "READY")?;
+    out.flush()?;
+    for line in std::io::stdin().lock().lines() {
+        let line = line?;
+        let f: Vec<&str> = line.splitn(6, ' ').collect();
+        let ["B", seq, x, y, z, block] = f[..] else {
+            return Err(format!("linha da ponte inválida: {line:?}").into());
+        };
+        let text = s.event(side, [x.parse()?, y.parse()?, z.parse()?], block)?;
+        writeln!(out, "R {seq} {}", text.replace('\n', "\u{1f}"))?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// Sobe o sidecar com o mod, lê os registros e mede `iters` eventos espaçados de `gap` (simula o tick).
+pub fn run(side: &mut Side, shared: &Shared, iters: usize, gap: Duration) -> Res<HostResult> {
+    let (mut s, items) = open(side, shared)?;
     let mut samples = Vec::with_capacity(iters);
     for seq in 0..(WARMUP + iters) as u64 {
         let us = s.trip(side, seq)?;
