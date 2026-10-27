@@ -42,6 +42,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_XMX_MB: u32 = 1024;
 const XMX_RANGE: std::ops::RangeInclusive<u32> = 512..=16384;
 const NO_WINDOW: u32 = 0x0800_0000;
+const LOCK_FILE: &str = "server.lock";
+const IN_USE: &str = "Another Horizon is already using the mods server in this folder. Close it first (or use another game folder), then try again.";
 
 pub const WARNING_TITLE: &str = "Modo com mods: leia antes de ativar";
 pub const WARNING_LINES: [&str; 10] = [
@@ -94,6 +96,28 @@ pub struct ModsServer {
     child: Child,
     stdin: Option<ChildStdin>,
     dir: PathBuf,
+    /// Held while the server runs; the OS drops it with the process, however Horizon ends.
+    _lock: Option<FolderLock>,
+}
+
+/// An exclusive OS lock on `<dir>/server.lock`: whoever holds it owns the folder's server and the
+/// `server.pid` next to it. A hard-killed Horizon releases it, so a free lock means any pidfile is stale.
+struct FolderLock {
+    _file: std::fs::File,
+}
+
+fn lock_folder(dir: &Path) -> Result<FolderLock, String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(LOCK_FILE))
+        .map_err(|e| e.to_string())?;
+    match file.try_lock() {
+        Ok(()) => Ok(FolderLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(IN_USE.to_owned()),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.to_string()),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -772,6 +796,7 @@ fn spawn_server(java: &Path, dir: &Path, config: &Config) -> Result<ModsServer, 
         child,
         stdin,
         dir: dir.to_owned(),
+        _lock: None,
     })
 }
 
@@ -869,7 +894,7 @@ fn kill_pid(pid: u32) {
 }
 
 /// A server left over by a client that was killed hard: ended only when the PID is a java process
-/// running our launcher jar and marker (PIDs get reused).
+/// running our launcher jar and marker (PIDs get reused). Call it only holding the folder lock.
 fn kill_stale(dir: &Path) {
     let Some(pid) = std::fs::read_to_string(dir.join("server.pid"))
         .ok()
@@ -905,9 +930,10 @@ fn kill_stale(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("server.pid"));
 }
 
-fn prepare(root: &Path, config: &Config, cancel: &AtomicBool) -> Result<(PathBuf, PathBuf), String> {
+fn prepare(root: &Path, config: &Config, cancel: &AtomicBool) -> Result<(PathBuf, PathBuf, FolderLock), String> {
     let dir = root.join(FOLDER);
     std::fs::create_dir_all(dir.join("mods")).map_err(|e| e.to_string())?;
+    let lock = lock_folder(&dir)?;
     kill_stale(&dir);
     let java = match find_java(root, config) {
         Ok(java) => java,
@@ -927,14 +953,14 @@ fn prepare(root: &Path, config: &Config, cancel: &AtomicBool) -> Result<(PathBuf
         "serverJar=server.jar\n",
     )
     .map_err(|e| e.to_string())?;
-    Ok((dir, java))
+    Ok((dir, java, lock))
 }
 
 /// Starts the hidden server on a random loopback port and waits for it; returns the port.
 /// `cancel` is polled while waiting. Blocks for tens of seconds: run it on a worker thread.
 pub fn start(root: &Path, config: &Config, cancel: &AtomicBool) -> Result<u16, String> {
     set_progress("", 0, 0);
-    let (dir, java) = prepare(root, config, cancel)?;
+    let (dir, java, lock) = prepare(root, config, cancel)?;
     let mut last = String::new();
     for _ in 0..2 {
         let port = choose_port().map_err(|e| e.to_string())?;
@@ -944,6 +970,7 @@ pub fn start(root: &Path, config: &Config, cancel: &AtomicBool) -> Result<u16, S
         match wait_ready(&mut server, cancel) {
             Wait::Ready if cancel.load(Ordering::Relaxed) => return Err("cancelled".into()),
             Wait::Ready => {
+                server._lock = Some(lock);
                 *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(server);
                 PORT.store(port, Ordering::Relaxed);
                 return Ok(port);
@@ -988,6 +1015,17 @@ mod tests {
                 .unwrap()
                 .starts_with("ddaf35a193617aba")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn second_holder_of_the_folder_is_refused_until_the_first_lets_go() {
+        let dir = std::env::temp_dir().join(format!("hz-mods-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = lock_folder(&dir).unwrap();
+        assert_eq!(lock_folder(&dir).err().as_deref(), Some(IN_USE));
+        drop(first);
+        drop(lock_folder(&dir).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1401,6 +1439,27 @@ mod live {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!base.join("staging").exists() && !base.join("jdk").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A second start in the same folder is refused at once and leaves the first server running.
+    #[test]
+    #[ignore]
+    fn second_instance_does_not_kill_the_first() {
+        let root = env_path("HORIZON_E2E_MODS");
+        let port = start(&root, &config(), &AtomicBool::new(false)).unwrap();
+        let pid = PID.load(Ordering::Relaxed);
+        assert!(pid_alive(pid));
+        let started = Instant::now();
+        let second = start(&root, &config(), &AtomicBool::new(false));
+        println!("second start after {:?}: {second:?}", started.elapsed());
+        assert_eq!(second, Err(IN_USE.to_owned()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(pid_alive(pid), "first server was killed");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(), "first server's port is gone");
+        stop_global();
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(!pid_alive(pid), "java left after stop");
+        assert!(lock_folder(&root.join(FOLDER)).is_ok(), "lock not released");
     }
 
     #[test]
