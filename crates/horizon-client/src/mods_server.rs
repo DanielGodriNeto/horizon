@@ -466,6 +466,23 @@ fn java_asset(assets: &serde_json::Value) -> Result<(String, String), String> {
     }
 }
 
+/// `io::copy` that looks at `cancel` between 64 KiB chunks: one JDK entry is over 100 MB.
+fn copy_cancellable(from: &mut impl Read, to: &mut impl Write, cancel: &AtomicBool) -> Result<u64, String> {
+    let mut chunk = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let n = from.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(total);
+        }
+        to.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
+        total += n as u64;
+    }
+}
+
 /// Unpacks a zip under `dest`; an entry that would leave it is an error, not skipped.
 fn extract_zip(zip_path: &Path, dest: &Path, cancel: &AtomicBool) -> Result<(), String> {
     let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
@@ -485,7 +502,7 @@ fn extract_zip(zip_path: &Path, dest: &Path, cancel: &AtomicBool) -> Result<(), 
         }
         std::fs::create_dir_all(out.parent().unwrap_or(dest)).map_err(|e| e.to_string())?;
         let mut file = std::fs::File::create(&out).map_err(|e| e.to_string())?;
-        std::io::copy(&mut entry, &mut file).map_err(|e| e.to_string())?;
+        copy_cancellable(&mut entry, &mut file, cancel)?;
     }
     Ok(())
 }
@@ -591,7 +608,7 @@ fn extract_tar_gz(archive: &Path, dest: &Path, cancel: &AtomicBool) -> Result<()
             b'0' | 0 | b'7' => {
                 std::fs::create_dir_all(target.parent().unwrap_or(dest)).map_err(|e| e.to_string())?;
                 let mut out = std::fs::File::create(&target).map_err(|e| e.to_string())?;
-                let copied = std::io::copy(&mut (&mut tar).take(size), &mut out).map_err(|e| format!("tar: {e}"))?;
+                let copied = copy_cancellable(&mut (&mut tar).take(size), &mut out, cancel)?;
                 if copied != size {
                     return Err("tar: the archive is cut short".into());
                 }
@@ -612,29 +629,38 @@ fn install_java(root: &Path, cancel: &AtomicBool) -> Result<(), String> {
     let base = root.join(JAVA_FOLDER);
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     let archive = base.join("jdk.archive");
+    let result = download(&link, &archive, Hash::Sha256, &sha256, cancel, "Baixando o Java 25").and_then(|()| {
+        set_progress("Extraindo o Java 25", 0, 0);
+        unpack_jdk(&base, &archive, os == "windows", cancel)
+    });
+    let _ = std::fs::remove_file(&archive);
+    set_progress("", 0, 0);
+    result
+}
+
+/// Extracts into `<base>/staging`, then swaps it in as `<base>/jdk`. Cancel or failure leaves no
+/// staging folder and the previous `jdk` (if any) untouched.
+fn unpack_jdk(base: &Path, archive: &Path, zip: bool, cancel: &AtomicBool) -> Result<(), String> {
     let staging = base.join("staging");
     let _ = std::fs::remove_dir_all(&staging);
-    let result = download(&link, &archive, Hash::Sha256, &sha256, cancel, "Baixando o Java 25")
-        .and_then(|()| {
-            set_progress("Extraindo o Java 25", 0, 0);
-            if os == "windows" {
-                extract_zip(&archive, &staging, cancel)
-            } else {
-                extract_tar_gz(&archive, &staging, cancel)
-            }
-        })
-        .and_then(|()| {
-            let top = std::fs::read_dir(&staging)
-                .map_err(|e| e.to_string())?
-                .flatten()
-                .find(|e| e.path().is_dir())
-                .ok_or("the JDK archive is empty")?;
-            let _ = std::fs::remove_dir_all(base.join("jdk"));
-            std::fs::rename(top.path(), base.join("jdk")).map_err(|e| e.to_string())
-        });
-    let _ = std::fs::remove_file(&archive);
+    let result = if zip {
+        extract_zip(archive, &staging, cancel)
+    } else {
+        extract_tar_gz(archive, &staging, cancel)
+    }
+    .and_then(|()| {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_owned());
+        }
+        let top = std::fs::read_dir(&staging)
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .find(|e| e.path().is_dir())
+            .ok_or("the JDK archive is empty")?;
+        let _ = std::fs::remove_dir_all(base.join("jdk"));
+        std::fs::rename(top.path(), base.join("jdk")).map_err(|e| e.to_string())
+    });
     let _ = std::fs::remove_dir_all(&staging);
-    set_progress("", 0, 0);
     result
 }
 
@@ -1245,6 +1271,69 @@ mod platform_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Raises the cancel flag once `after` bytes were read, like a click in the middle of an entry.
+    struct CancelAfter<'a> {
+        left: usize,
+        flag: &'a AtomicBool,
+    }
+
+    impl Read for CancelAfter<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left);
+            buf[..n].fill(1);
+            self.left -= n;
+            if self.left < 1_000_000 {
+                self.flag.store(true, Ordering::Relaxed);
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn copy_stops_inside_a_big_entry_when_cancelled() {
+        let flag = AtomicBool::new(false);
+        let mut out = Vec::new();
+        let err = copy_cancellable(&mut CancelAfter { left: 3_000_000, flag: &flag }, &mut out, &flag);
+        assert_eq!(err, Err("cancelled".to_owned()));
+        assert!(out.len() >= 2_000_000 && out.len() < 3_000_000, "{}", out.len());
+        let mut all = Vec::new();
+        let idle = AtomicBool::new(false);
+        assert_eq!(copy_cancellable(&mut &[7u8; 100_000][..], &mut all, &idle), Ok(100_000));
+    }
+
+    fn jdk_zip(path: &Path, entries: &[&str]) {
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for name in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"data").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn cancelled_or_failed_unpack_leaves_no_staging_and_keeps_the_old_jdk() {
+        let base = std::env::temp_dir().join(format!("hz-mods-unpack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("jdk")).unwrap();
+        std::fs::write(base.join("jdk/old"), b"old").unwrap();
+        // The second entry is rejected after the first was already written to staging.
+        let bad = base.join("bad.zip");
+        jdk_zip(&bad, &["jdk-25/bin/java.exe", "../escape.txt"]);
+        let go = AtomicBool::new(false);
+        assert!(unpack_jdk(&base, &bad, true, &go).is_err());
+        assert!(!base.join("staging").exists());
+        assert!(base.join("jdk/old").is_file());
+        let good = base.join("good.zip");
+        jdk_zip(&good, &["jdk-25/bin/java.exe"]);
+        assert_eq!(unpack_jdk(&base, &good, true, &AtomicBool::new(true)), Err("cancelled".to_owned()));
+        assert!(!base.join("staging").exists());
+        assert!(base.join("jdk/old").is_file());
+        unpack_jdk(&base, &good, true, &go).unwrap();
+        assert!(base.join("jdk/bin/java.exe").is_file() && !base.join("jdk/old").exists());
+        assert!(!base.join("staging").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn progress_label() {
         let p = Progress { what: "x", done: 42_500_000, total: 141_285_173 };
@@ -1288,6 +1377,29 @@ mod live {
         assert!(java_major(&java).is_some_and(|m| m >= 25));
         assert!(!root.join(JAVA_FOLDER).join("jdk.archive").exists());
         assert!(!root.join(JAVA_FOLDER).join("staging").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `HORIZON_E2E_JDKZIP` = a real JDK zip: cancel 400 ms into the unpack, nothing partial is left.
+    #[test]
+    #[ignore]
+    fn cancel_during_a_real_jdk_unpack_cleans_up() {
+        let root = scratch("unpack");
+        let base = root.join(JAVA_FOLDER);
+        std::fs::create_dir_all(&base).unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let timer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let result = unpack_jdk(&base, &env_path("HORIZON_E2E_JDKZIP"), true, &cancel);
+        timer.join().unwrap();
+        println!("unpack cancelled after {:?}: {result:?}", started.elapsed());
+        assert_eq!(result, Err("cancelled".to_owned()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!base.join("staging").exists() && !base.join("jdk").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
