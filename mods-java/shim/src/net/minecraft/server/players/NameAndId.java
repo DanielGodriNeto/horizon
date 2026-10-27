@@ -1,0 +1,4 @@
+package net.minecraft.server.players;
+
+/** Shim stub (generated): empty, only so signatures resolve. */
+public class NameAndId {}
