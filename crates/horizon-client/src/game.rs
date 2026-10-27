@@ -14168,7 +14168,7 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
-                match if loading.menu.reload_packs {
+                match if loading.menu.reload_packs || loading.menu.mods_flow_busy() {
                     None
                 } else {
                     loading.loaded.take()

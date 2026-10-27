@@ -26,8 +26,6 @@ const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manif
 const MOJANG_SERVER_SHA1: &str = "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c";
 const JAVA_MISSING: &str = "Java 25 was not found. Install it (for example Eclipse Temurin 25), or put its java path in horizon-mods-server.txt as java=<path>, then try again.";
 const JAVA_FOLDER: &str = "mods-java";
-#[cfg(windows)]
-const JAVA_API_URL: &str = "https://api.adoptium.net/v3/assets/latest/25/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse";
 const ALLOWED_HOSTS: [&str; 7] = [
     "piston-meta.mojang.com",
     "piston-data.mojang.com",
@@ -58,6 +56,35 @@ pub const WARNING_LINES: [&str; 10] = [
     "- Na primeira vez o lançador do Fabric baixa as próprias bibliotecas (maven.fabricmc.net, Mojang), sem verificação do Horizon.",
     "- Ao ativar você aceita também o EULA do Minecraft (minecraft.net/eula) para esse servidor.",
 ];
+
+/// What the startup screen shows while a download or an unpack runs.
+#[derive(Clone, Copy, Default)]
+pub struct Progress {
+    pub what: &'static str,
+    pub done: u64,
+    pub total: u64,
+}
+
+impl Progress {
+    /// `42 / 141 MB`, or just `42 MB` while the size is unknown.
+    pub fn label(&self) -> String {
+        let mb = |n: u64| n / 1_000_000;
+        match self.total {
+            0 => format!("{} MB", mb(self.done)),
+            total => format!("{} / {} MB", mb(self.done), mb(total)),
+        }
+    }
+}
+
+static PROGRESS: Mutex<Progress> = Mutex::new(Progress { what: "", done: 0, total: 0 });
+
+fn set_progress(what: &'static str, done: u64, total: u64) {
+    *PROGRESS.lock().unwrap_or_else(|e| e.into_inner()) = Progress { what, done, total };
+}
+
+pub fn progress() -> Progress {
+    *PROGRESS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 static ACTIVE: Mutex<Option<ModsServer>> = Mutex::new(None);
 static PORT: AtomicU16 = AtomicU16::new(0);
@@ -254,7 +281,8 @@ pub fn quiet_pack(url: &str) -> bool {
     }
 }
 
-fn http_get(url: &str) -> Result<Box<dyn Read + Send + Sync>, String> {
+/// The body and its announced length (when the server sends one).
+fn http_get(url: &str) -> Result<(Box<dyn Read + Send + Sync>, Option<u64>), String> {
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
         .timeout_connect(Duration::from_secs(15))
@@ -273,7 +301,8 @@ fn http_get(url: &str) -> Result<Box<dyn Read + Send + Sync>, String> {
                 .to_owned();
             continue;
         }
-        return Ok(response.into_reader());
+        let length = response.header("content-length").and_then(|v| v.parse().ok());
+        return Ok((response.into_reader(), length));
     }
     Err("too many redirects".into())
 }
@@ -285,10 +314,14 @@ fn download(
     hash: Hash,
     expected: &str,
     cancel: &AtomicBool,
+    what: &'static str,
 ) -> Result<(), String> {
     let part = dest.with_extension("part");
     let result = (|| {
-        let mut reader = http_get(url)?;
+        let (mut reader, length) = http_get(url)?;
+        let total = length.unwrap_or(0);
+        let mut done = 0u64;
+        set_progress(what, 0, total);
         let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
         let mut chunk = [0u8; 64 * 1024];
         loop {
@@ -300,6 +333,8 @@ fn download(
                 break;
             }
             file.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
+            done += n as u64;
+            set_progress(what, done, total);
         }
         file.flush().map_err(|e| e.to_string())?;
         verify_file(&part, hash, expected)?;
@@ -308,11 +343,12 @@ fn download(
     if result.is_err() {
         let _ = std::fs::remove_file(&part);
     }
+    set_progress("", 0, 0);
     result
 }
 
 fn fetch_json(url: &str) -> Result<serde_json::Value, String> {
-    serde_json::from_reader(http_get(url)?).map_err(|e| format!("{url}: {e}"))
+    serde_json::from_reader(http_get(url)?.0).map_err(|e| format!("{url}: {e}"))
 }
 
 /// Mojang's server jar and its SHA-1, from the official manifest.
@@ -340,13 +376,20 @@ fn ensure_jars(dir: &Path, cancel: &AtomicBool) -> Result<(), String> {
     }
     if !server.is_file() {
         let (url, _) = mojang_server_jar()?;
-        download(&url, &server, Hash::Sha1, MOJANG_SERVER_SHA1, cancel)?;
+        download(&url, &server, Hash::Sha1, MOJANG_SERVER_SHA1, cancel, "Baixando o servidor do Minecraft")?;
     }
     let launcher = dir.join(LAUNCH_JAR);
     if launcher.is_file() {
         verify_file(&launcher, Hash::Sha256, FABRIC_LAUNCHER_SHA256)?;
     } else {
-        download(FABRIC_LAUNCHER_URL, &launcher, Hash::Sha256, FABRIC_LAUNCHER_SHA256, cancel)?;
+        download(
+            FABRIC_LAUNCHER_URL,
+            &launcher,
+            Hash::Sha256,
+            FABRIC_LAUNCHER_SHA256,
+            cancel,
+            "Baixando o lançador do Fabric",
+        )?;
     }
     Ok(())
 }
@@ -373,10 +416,46 @@ fn enable_autohost(dir: &Path) -> Result<(), String> {
     std::fs::write(&file, text).map_err(|e| e.to_string())
 }
 
+/// Adoptium's (os, architecture) names for this machine; None when it has no Temurin build.
+fn java_platform() -> Option<(&'static str, &'static str)> {
+    let os = match std::env::consts::OS {
+        "windows" => "windows",
+        "linux" => "linux",
+        "macos" => "mac",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "aarch64",
+        _ => return None,
+    };
+    Some((os, arch))
+}
+
+fn java_api_url(os: &str, arch: &str) -> String {
+    format!(
+        "https://api.adoptium.net/v3/assets/latest/25/hotspot?architecture={arch}&image_type=jdk&os={os}&vendor=eclipse"
+    )
+}
+
+/// `java` inside the unpacked JDK folder (a macOS JDK is an app bundle).
+fn java_exe_parts(os: &str) -> &'static [&'static str] {
+    match os {
+        "windows" => &["bin", "java.exe"],
+        "mac" => &["Contents", "Home", "bin", "java"],
+        _ => &["bin", "java"],
+    }
+}
+
+fn own_java_for(root: &Path, os: &str) -> PathBuf {
+    let mut path = root.join(JAVA_FOLDER).join("jdk");
+    path.extend(java_exe_parts(os));
+    path
+}
+
 /// Where Horizon installs its own JDK.
 fn own_java(root: &Path) -> PathBuf {
-    let exe = if cfg!(windows) { "java.exe" } else { "java" };
-    root.join(JAVA_FOLDER).join("jdk").join("bin").join(exe)
+    own_java_for(root, java_platform().map_or("linux", |(os, _)| os))
 }
 
 fn java_asset(assets: &serde_json::Value) -> Result<(String, String), String> {
@@ -388,10 +467,13 @@ fn java_asset(assets: &serde_json::Value) -> Result<(String, String), String> {
 }
 
 /// Unpacks a zip under `dest`; an entry that would leave it is an error, not skipped.
-fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
+fn extract_zip(zip_path: &Path, dest: &Path, cancel: &AtomicBool) -> Result<(), String> {
     let file = std::fs::File::open(zip_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
     for i in 0..archive.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
         let rel = entry
             .enclosed_name()
@@ -408,18 +490,139 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A tar member name as a path under the extraction root; None when it could leave it.
+/// An empty result is the root itself (`./`).
+fn safe_member(name: &str) -> Option<PathBuf> {
+    if name.starts_with('/') || name.contains('\\') || name.contains(':') {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for part in name.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            part => out.push(part),
+        }
+    }
+    Some(out)
+}
+
+fn tar_text(field: &[u8]) -> String {
+    let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end]).into_owned()
+}
+
+fn tar_octal(field: &[u8]) -> Result<u64, String> {
+    let text = std::str::from_utf8(field).map_err(|_| "tar: bad header")?;
+    let text = text.trim_matches(|c| c == '\0' || c == ' ');
+    if text.is_empty() {
+        return Ok(0);
+    }
+    u64::from_str_radix(text, 8).map_err(|_| "tar: bad header".to_owned())
+}
+
+/// The `path=` of a PAX extended header (`<len> key=value\n` records).
+fn pax_path(data: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(data);
+    text.split_inclusive('\n').find_map(|record| {
+        let (_, pair) = record.split_once(' ')?;
+        pair.trim_end_matches('\n').strip_prefix("path=").map(str::to_owned)
+    })
+}
+
+fn tar_skip(tar: &mut impl Read, n: u64) -> Result<(), String> {
+    match std::io::copy(&mut tar.take(n), &mut std::io::sink()) {
+        Ok(got) if got == n => Ok(()),
+        Ok(_) => Err("tar: the archive is cut short".into()),
+        Err(e) => Err(format!("tar: {e}")),
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u64) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode((mode & 0o777) as u32 | 0o600));
+}
+#[cfg(not(unix))]
+fn set_mode(_: &Path, _: u64) {}
+
+/// Unpacks a `.tar.gz` under `dest` with a small ustar/PAX/GNU reader. Files and directories only:
+/// links and devices are never created (so nothing in the tree can point outside it), and a member
+/// name that would leave `dest` is an error.
+fn extract_tar_gz(archive: &Path, dest: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut tar = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
+    let mut long_name: Option<String> = None;
+    let mut header = [0u8; 512];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        tar.read_exact(&mut header).map_err(|e| format!("tar: {e}"))?;
+        if header.iter().all(|b| *b == 0) {
+            return Ok(());
+        }
+        let size = tar_octal(&header[124..136])?;
+        let kind = header[156];
+        let padding = (512 - size % 512) % 512;
+        if matches!(kind, b'L' | b'x') {
+            if size > 64 * 1024 {
+                return Err("tar: oversized header".into());
+            }
+            let mut data = vec![0u8; size as usize];
+            tar.read_exact(&mut data).map_err(|e| format!("tar: {e}"))?;
+            tar_skip(&mut tar, padding)?;
+            long_name = if kind == b'L' { Some(tar_text(&data)) } else { pax_path(&data).or(long_name) };
+            continue;
+        }
+        let name = long_name.take().unwrap_or_else(|| {
+            let base = tar_text(&header[..100]);
+            let prefix = tar_text(&header[345..500]);
+            if &header[257..262] == b"ustar" && !prefix.is_empty() { format!("{prefix}/{base}") } else { base }
+        });
+        let rel = safe_member(&name).ok_or_else(|| format!("unsafe path in the archive: {name}"))?;
+        let target = dest.join(&rel);
+        match kind {
+            _ if rel.as_os_str().is_empty() => tar_skip(&mut tar, size + padding)?,
+            b'5' => {
+                std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+                tar_skip(&mut tar, size + padding)?;
+            }
+            b'0' | 0 | b'7' => {
+                std::fs::create_dir_all(target.parent().unwrap_or(dest)).map_err(|e| e.to_string())?;
+                let mut out = std::fs::File::create(&target).map_err(|e| e.to_string())?;
+                let copied = std::io::copy(&mut (&mut tar).take(size), &mut out).map_err(|e| format!("tar: {e}"))?;
+                if copied != size {
+                    return Err("tar: the archive is cut short".into());
+                }
+                drop(out);
+                set_mode(&target, tar_octal(&header[100..108])?);
+                tar_skip(&mut tar, padding)?;
+            }
+            _ => tar_skip(&mut tar, size + padding)?,
+        }
+    }
+}
+
 /// Downloads Temurin 25 from Adoptium (sha256 from its API) into `<root>/mods-java/jdk`.
-/// Never touches the user's own Java. Windows x64 only; elsewhere the user installs Java.
-#[cfg(windows)]
+/// Never touches the user's own Java.
 fn install_java(root: &Path, cancel: &AtomicBool) -> Result<(), String> {
-    let (link, sha256) = java_asset(&fetch_json(JAVA_API_URL)?)?;
+    let (os, arch) = java_platform().ok_or(JAVA_MISSING)?;
+    let (link, sha256) = java_asset(&fetch_json(&java_api_url(os, arch))?)?;
     let base = root.join(JAVA_FOLDER);
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-    let zip_path = base.join("jdk.zip");
+    let archive = base.join("jdk.archive");
     let staging = base.join("staging");
     let _ = std::fs::remove_dir_all(&staging);
-    let result = download(&link, &zip_path, Hash::Sha256, &sha256, cancel)
-        .and_then(|()| extract_zip(&zip_path, &staging))
+    let result = download(&link, &archive, Hash::Sha256, &sha256, cancel, "Baixando o Java 25")
+        .and_then(|()| {
+            set_progress("Extraindo o Java 25", 0, 0);
+            if os == "windows" {
+                extract_zip(&archive, &staging, cancel)
+            } else {
+                extract_tar_gz(&archive, &staging, cancel)
+            }
+        })
         .and_then(|()| {
             let top = std::fs::read_dir(&staging)
                 .map_err(|e| e.to_string())?
@@ -429,14 +632,10 @@ fn install_java(root: &Path, cancel: &AtomicBool) -> Result<(), String> {
             let _ = std::fs::remove_dir_all(base.join("jdk"));
             std::fs::rename(top.path(), base.join("jdk")).map_err(|e| e.to_string())
         });
-    let _ = std::fs::remove_file(&zip_path);
+    let _ = std::fs::remove_file(&archive);
     let _ = std::fs::remove_dir_all(&staging);
+    set_progress("", 0, 0);
     result
-}
-
-#[cfg(not(windows))]
-fn install_java(_: &Path, _: &AtomicBool) -> Result<(), String> {
-    Err(JAVA_MISSING.to_owned())
 }
 
 /// The jars in `mods/`: plain names, zip files only. Returns (name, sha512) for the log.
@@ -708,6 +907,7 @@ fn prepare(root: &Path, config: &Config, cancel: &AtomicBool) -> Result<(PathBuf
 /// Starts the hidden server on a random loopback port and waits for it; returns the port.
 /// `cancel` is polled while waiting. Blocks for tens of seconds: run it on a worker thread.
 pub fn start(root: &Path, config: &Config, cancel: &AtomicBool) -> Result<u16, String> {
+    set_progress("", 0, 0);
     let (dir, java) = prepare(root, config, cancel)?;
     let mut last = String::new();
     for _ in 0..2 {
@@ -920,11 +1120,136 @@ mod install_tests {
             zip.write_all(b"data").unwrap();
             zip.finish().unwrap();
         }
-        extract_zip(&good, &dir.join("out")).unwrap();
+        let go = AtomicBool::new(false);
+        extract_zip(&good, &dir.join("out"), &go).unwrap();
         assert!(dir.join("out/jdk/bin/java.exe").is_file());
-        assert!(extract_zip(&evil, &dir.join("out2")).is_err());
+        assert!(extract_zip(&evil, &dir.join("out2"), &go).is_err());
         assert!(!dir.join("escaped.txt").exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    fn tar_header(name: &str, size: usize, kind: u8) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        h[100..108].copy_from_slice(b"0000755\0");
+        h[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+        h[156] = kind;
+        h
+    }
+
+    fn entry(out: &mut Vec<u8>, name: &str, kind: u8, data: &[u8]) {
+        out.extend(tar_header(name, data.len(), kind));
+        out.extend(data);
+        out.resize(out.len() + (512 - data.len() % 512) % 512, 0);
+    }
+
+    fn tar_gz(tar: &[u8]) -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(tar).unwrap();
+        gz.write_all(&[0u8; 1024]).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn unpack(name: &str, bytes: &[u8]) -> (PathBuf, Result<(), String>) {
+        let dir = std::env::temp_dir().join(format!("hz-mods-tar-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("a.tar.gz");
+        std::fs::write(&archive, bytes).unwrap();
+        let result = extract_tar_gz(&archive, &dir.join("out"), &AtomicBool::new(false));
+        (dir, result)
+    }
+
+    #[test]
+    fn adoptium_choice_per_platform() {
+        let url = java_api_url("mac", "aarch64");
+        assert!(url.starts_with("https://api.adoptium.net/") && allowed_url(&url));
+        assert!(url.contains("architecture=aarch64") && url.contains("os=mac") && url.contains("/latest/25/"));
+        assert!(java_api_url("linux", "x64").contains("os=linux&vendor=eclipse"));
+        let root = Path::new("root");
+        assert!(own_java_for(root, "mac").ends_with("jdk/Contents/Home/bin/java"));
+        assert!(own_java_for(root, "linux").ends_with("jdk/bin/java"));
+        assert!(own_java_for(root, "windows").ends_with("jdk/bin/java.exe"));
+    }
+
+    #[test]
+    fn member_names_cannot_leave_the_folder() {
+        assert_eq!(safe_member("jdk-25/bin/java"), Some(PathBuf::from("jdk-25").join("bin").join("java")));
+        assert_eq!(safe_member("./"), Some(PathBuf::new()));
+        for bad in ["../x", "a/../../x", "/etc/passwd", "a\\b", "C:/x"] {
+            assert_eq!(safe_member(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn tar_gz_unpacks_files_dirs_pax_and_gnu_long_names() {
+        let long = format!("jdk-25/{}/file.txt", "d".repeat(130));
+        let record = {
+            let body = format!(" path={long}\n");
+            format!("{}{body}", body.len() + 3)
+        };
+        let gnu = format!("jdk-25/{}/gnu.txt", "g".repeat(130));
+        let mut tar = Vec::new();
+        entry(&mut tar, "jdk-25/", b'5', b"");
+        entry(&mut tar, "jdk-25/bin/java", b'0', b"binary");
+        entry(&mut tar, "pax", b'x', record.as_bytes());
+        entry(&mut tar, "short", b'0', b"pax data");
+        entry(&mut tar, "././@LongLink", b'L', format!("{gnu}\0").as_bytes());
+        entry(&mut tar, "short2", b'0', b"gnu data");
+        let (dir, result) = unpack("ok", &tar_gz(&tar));
+        result.unwrap();
+        let out = dir.join("out");
+        assert_eq!(std::fs::read(out.join("jdk-25/bin/java")).unwrap(), b"binary");
+        assert_eq!(std::fs::read(out.join(&long)).unwrap(), b"pax data");
+        assert_eq!(std::fs::read(out.join(&gnu)).unwrap(), b"gnu data");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tar_gz_refuses_escapes_and_never_creates_links() {
+        for evil in ["../escaped.txt", "a/../../escaped.txt", "/abs.txt"] {
+            let mut tar = Vec::new();
+            entry(&mut tar, evil, b'0', b"x");
+            let (dir, result) = unpack("evil", &tar_gz(&tar));
+            assert!(result.is_err(), "{evil}");
+            assert!(!dir.join("escaped.txt").exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        let mut tar = Vec::new();
+        entry(&mut tar, "link", b'2', b"");
+        entry(&mut tar, "hard", b'1', b"");
+        entry(&mut tar, "kept", b'0', b"ok");
+        let (dir, result) = unpack("links", &tar_gz(&tar));
+        result.unwrap();
+        let out = dir.join("out");
+        assert!(std::fs::symlink_metadata(out.join("link")).is_err());
+        assert!(std::fs::symlink_metadata(out.join("hard")).is_err());
+        assert!(out.join("kept").is_file());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tar_gz_cut_short_is_an_error() {
+        let mut tar = Vec::new();
+        entry(&mut tar, "big", b'0', &[7u8; 2000]);
+        tar.truncate(700);
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar).unwrap();
+        let (dir, result) = unpack("cut", &gz.finish().unwrap());
+        assert!(result.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn progress_label() {
+        let p = Progress { what: "x", done: 42_500_000, total: 141_285_173 };
+        assert_eq!(p.label(), "42 / 141 MB");
+        assert_eq!(Progress { total: 0, ..p }.label(), "42 MB");
     }
 }
 
@@ -961,7 +1286,7 @@ mod live {
         let java = own_java(&root);
         println!("installed java major: {:?}", java_major(&java));
         assert!(java_major(&java).is_some_and(|m| m >= 25));
-        assert!(!root.join(JAVA_FOLDER).join("jdk.zip").exists());
+        assert!(!root.join(JAVA_FOLDER).join("jdk.archive").exists());
         assert!(!root.join(JAVA_FOLDER).join("staging").exists());
         std::fs::remove_dir_all(root).unwrap();
     }

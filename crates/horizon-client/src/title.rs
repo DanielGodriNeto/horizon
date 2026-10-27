@@ -408,6 +408,15 @@ impl Title {
     pub fn is_mods_starting(&self) -> bool {
         matches!(self.mode, Mode::ModsStarting)
     }
+    /// The warning or the waiting screen is up, so the startup menu still has to answer its buttons.
+    pub fn is_mods_flow(&self) -> bool {
+        matches!(self.mode, Mode::ModsWarning | Mode::ModsStarting)
+    }
+    /// The mods server did not start: show why, and the dismiss button lands on the normal menu.
+    pub fn mods_failed(&mut self, error: impl std::fmt::Display) {
+        self.mode = Mode::Main;
+        self.failed(error);
+    }
     pub fn failed(&mut self, error: impl std::fmt::Display) {
         let return_to = Box::new(self.mode.clone());
         self.mode = Mode::Error {
@@ -824,7 +833,7 @@ impl Title {
                 (w / 2.0).floor() - 75.0,
                 h.ceil() - 36.0,
                 150.0,
-                &lang::get_or("gui.back", "Back"),
+                &lang::get_or("gui.cancel", "Cancel"),
                 true,
                 73,
             )],
@@ -1127,13 +1136,23 @@ impl Title {
             }
             Mode::ModsStarting => {
                 crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
-                centered(
-                    atlas,
-                    batch,
-                    "Iniciando o servidor de mods...",
-                    confirm_top(h, 1) + 17.0,
-                    u32::MAX,
-                );
+                let progress = mods_server::progress();
+                let top = confirm_top(h, 1) + 17.0;
+                let title = if progress.what.is_empty() {
+                    "Iniciando o servidor de mods..."
+                } else {
+                    progress.what
+                };
+                centered(atlas, batch, title, top, u32::MAX);
+                if progress.total > 0 {
+                    let (bar_w, x) = (200.0, (w / 2.0).floor() - 100.0);
+                    let filled = (bar_w * (progress.done as f32 / progress.total as f32).min(1.0)).floor();
+                    batch.fill(atlas, x, top + 14.0, bar_w, 8.0, 0xFF303030);
+                    batch.fill(atlas, x, top + 14.0, filled, 8.0, 0xFF55FF55);
+                    centered(atlas, batch, &progress.label(), top + 26.0, u32::MAX);
+                } else if progress.done > 0 {
+                    centered(atlas, batch, &progress.label(), top + 14.0, u32::MAX);
+                }
             }
             Mode::Backup { .. } => {
                 self.backup_shown.set(true);

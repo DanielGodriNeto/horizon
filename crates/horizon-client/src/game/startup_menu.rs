@@ -99,6 +99,12 @@ impl StartupMenu {
         }
     }
 
+    /// True while the mods warning or the server start is on screen: `Game` cannot answer those buttons.
+    pub(super) fn mods_flow_busy(&self) -> bool {
+        self.pending.is_none()
+            && (self.mods_start.is_some() || self.title.as_ref().is_some_and(|t| t.is_mods_flow()))
+    }
+
     fn cwd() -> PathBuf {
         std::env::current_dir().unwrap_or_default()
     }
@@ -124,7 +130,7 @@ impl StartupMenu {
             }
             Err(error) => {
                 if let Some(title) = &mut self.title {
-                    title.failed(format!("Servidor de mods: {error}"));
+                    title.mods_failed(format!("Servidor de mods: {error}"));
                 }
             }
         }
@@ -158,7 +164,7 @@ impl StartupMenu {
             }
             Err(message) => {
                 if let Some(title) = &mut self.title {
-                    title.failed(format!("Servidor de mods: {message}. Modo normal."));
+                    title.mods_failed(format!("Servidor de mods: {message}. Modo normal."));
                 }
             }
         }
@@ -511,7 +517,7 @@ impl Loading {
                     Ok(()) => self.menu.begin_mods_start(),
                     Err(error) => {
                         if let Some(title) = &mut self.menu.title {
-                            title.failed(format!("Servidor de mods: {error}"));
+                            title.mods_failed(format!("Servidor de mods: {error}"));
                         }
                     }
                 }
