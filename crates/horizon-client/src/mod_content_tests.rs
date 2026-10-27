@@ -876,3 +876,61 @@ fn a_replacing_mod_tag_reaches_the_root() {
     );
     let _ = fs::remove_dir_all(&scratch);
 }
+
+/// A Fabric data jar dropped in the mods folder reaches the resource root
+/// like a native content mod: its item gets a network id and its language
+/// file is in the tree.
+#[cfg(feature = "foreign")]
+#[test]
+fn fabric_data_jar_loads_into_content_root() {
+    use std::io::Write;
+    let Some(base) = prepared() else {
+        return;
+    };
+    let scratch = std::env::temp_dir().join(format!("horizon-foreign-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let mods = scratch.join("horizon-mods");
+    fs::create_dir_all(&mods).unwrap();
+    let jar = mods.join("gemdata-1.0.jar");
+    let mut zip = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+    let opts = zip::write::SimpleFileOptions::default();
+    let entries = [
+        (
+            "fabric.mod.json",
+            r#"{"schemaVersion":1,"id":"gemdata","version":"1.0.0","name":"Gem Data","environment":"*"}"#,
+        ),
+        (
+            "data/gemdata/horizon/item/gem.json",
+            r#"{"template": "minecraft:diamond", "max_stack_size": 16}"#,
+        ),
+        (
+            "data/c/tags/item/gems/gem.json",
+            r#"{"values": ["gemdata:gem"]}"#,
+        ),
+        (
+            "assets/gemdata/lang/en_us.json",
+            r#"{"item.gemdata.gem": "Gem"}"#,
+        ),
+    ];
+    for (name, text) in entries {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(text.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let found = horizon_mods::find(&mods);
+    assert_eq!(found, vec![jar.clone()]);
+    let package = horizon_mods::Package::read(&jar).unwrap();
+    let content = Content::read(&jar, &package.manifest).unwrap();
+    let m = ContentMod {
+        id: package.manifest.id.clone(),
+        content,
+    };
+    let relative = Path::new("../../.local/horizon-client/26.3");
+    let root = resource_root(relative, std::slice::from_ref(&m), &scratch.join("cache")).unwrap();
+    assert_ne!(root, base);
+    assert!(root.join("assets/gemdata/lang/en_us.json").exists());
+    let ids = horizon_protocol::registry::Builtin::load(&root.join("registries.json")).unwrap();
+    assert!(ids.get("minecraft:item").unwrap().id("gemdata:gem").is_some());
+    let _ = fs::remove_dir_all(&scratch);
+}
