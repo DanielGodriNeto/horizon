@@ -343,7 +343,14 @@ impl Package {
                     .map_err(|e| e.to_string())?;
                 Ok(Some(out))
             };
-            let toml = entry(MANIFEST)?.ok_or_else(|| format!("{MANIFEST}: missing"))?;
+            let toml = match entry(MANIFEST)? {
+                Some(toml) => toml,
+                #[cfg(feature = "foreign")]
+                None if path.extension().is_some_and(|e| e == "jar") => {
+                    return crate::foreign::package(path);
+                }
+                None => return Err(format!("{MANIFEST}: missing")),
+            };
             let toml = String::from_utf8(toml).map_err(|_| format!("{MANIFEST}: not UTF-8"))?;
             (toml, entry(WASM)?)
         };
@@ -398,10 +405,23 @@ pub fn find(dir: &Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = read
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "hmod") || p.join(MANIFEST).is_file())
+        .filter(|p| p.extension().is_some_and(mod_extension) || p.join(MANIFEST).is_file())
         .collect();
     found.sort();
     found
+}
+
+/// Whether an extension makes a file a mod: `.hmod`, and `.jar` with the
+/// `foreign` feature.
+fn mod_extension(ext: &std::ffi::OsStr) -> bool {
+    #[cfg(feature = "foreign")]
+    {
+        ext == "hmod" || ext == "jar"
+    }
+    #[cfg(not(feature = "foreign"))]
+    {
+        ext == "hmod"
+    }
 }
 
 /// Turns a `wasm32-unknown-unknown` cdylib built with the SDK into the

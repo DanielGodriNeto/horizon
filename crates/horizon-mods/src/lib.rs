@@ -7,6 +7,8 @@
 //! [`Mods`] makes no engine and every hook returns at once.
 pub mod api_level;
 pub mod content;
+#[cfg(feature = "foreign")]
+pub mod foreign;
 #[cfg(feature = "index")]
 pub mod index;
 pub mod manifest;

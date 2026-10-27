@@ -38,6 +38,8 @@ runtime = ["dep:wasmtime", "dep:wasmparser"]
 pack = ["dep:wit-component", "dep:wit-parser"]
 # The mod registry's index (docs/api/mod-index.md): the launcher, the registry server and its CI.
 index = ["dep:sha2", "dep:minisign-verify", "dep:horizon-shader-api", "dep:wasmparser"]
+# Foreign mod jars (Fabric data mods, datapacks): off by default, a [turbo] experiment.
+foreign = []
 
 # Runs real mods: `cargo test -p horizon-mods --features runtime,pack`.
 [[test]]
