@@ -28,3 +28,16 @@ Despertar por pipe (sem dependência nova): cabeçalho ganha `u32 sleeping` no o
 - Java, quando ocioso por mais de SPIN (padrão 50 µs): `sleeping = 1` (volatile/seq-cst), relê `tail` de A (volatile); se há dados, `sleeping = 0` e segue; senão bloqueia em `System.in.read()` (um byte; depois drene `System.in.available()`), e ao acordar `sleeping = 0`. EOF no stdin = pai morreu ou fechou: tratar como shutdown e sair com 0.
 - Rust, depois de publicar `tail` de A (release): `fence(SeqCst)`; se `sleeping == 1`, escreve 1 byte no stdin do filho (e flush). Pode haver bytes extras: o Java os ignora.
 - `shutdown = 1` também deve acordar: Rust escreve um byte depois de gravar `shutdown`.
+
+## Mensagens do host (modo `Sidecar <arquivo> host <mod.jar>`)
+
+Sobre os mesmos anéis; payload little-endian, primeiro byte = tipo. O sidecar carrega o mod (`horizon.LiveHost`
+do shim, por reflexão), grava os registros em B **antes** de `java_ready = 1` e só então atende A.
+
+| Tipo | Sentido | Corpo |
+|---|---|---|
+| 1 REGISTER_ITEM | Java -> Rust | u16 tamanho do id, id UTF-8 (`ns:path`), JSON de conteúdo do item |
+| 2 BLOCK_BREAK | Rust -> Java | u64 seq, i32 x, i32 y, i32 z, id do bloco UTF-8 (resto) |
+| 3 REPLY | Java -> Rust | u64 seq, mensagens que o mod mandou ao jogador (UTF-8, `\n` entre elas; vazio se nenhuma) |
+
+Cada BLOCK_BREAK gera exatamente um REPLY com o mesmo seq (o callback `PlayerBlockBreakEvents.AFTER` do mod roda no meio).

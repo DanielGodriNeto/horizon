@@ -1,6 +1,7 @@
 //! Bench P3: latência do sidecar JVM sobre anel de memória, com linha de base por pipes.
 mod args;
 mod bench;
+mod host;
 mod msg;
 mod pipe;
 mod report;
@@ -33,10 +34,13 @@ fn run() -> Res<()> {
     let args = args::parse(std::env::args().skip(1))?;
     let file = std::env::temp_dir().join(format!("p3-ring-{}.bin", std::process::id()));
     let shared = Shared::create(&file, shm::CAP)?;
-    let outcome = measure_all(&args, &shared, &file);
+    let text = match &args.host_jar {
+        Some(jar) => run_host(&args, &shared, &file, jar),
+        None => measure_all(&args, &shared, &file).map(|r| report::render(&r)),
+    };
     drop(shared);
     let _ = std::fs::remove_file(&file);
-    let text = report::render(&outcome?);
+    let text = text?;
     report::emit(&text, args.out.as_deref())
 }
 
@@ -74,7 +78,7 @@ fn bench_sidecar(args: &Args, shared: &Shared, file: &Path, plan: &Plan) -> Res<
 fn start<'a>(args: &Args, shared: &'a Shared, file: &Path) -> Res<(Side, Link<'a>, Startup)> {
     shared.reset();
     let t0 = Instant::now();
-    let mut side = Side::spawn(&args.java, &args.sidecar_cp, file)?;
+    let mut side = Side::spawn(&args.java, &args.sidecar_cp, file, None)?;
     side.await_ready(shared)?;
     let ready = t0.elapsed();
     let mut link = Link::new(shared);
@@ -89,4 +93,16 @@ fn crash_test(args: &Args, shared: &Shared, file: &Path) -> Res<Duration> {
     let (side, _link, startup) = start(args, shared, file)?;
     side.stop(shared)?;
     Ok(startup.echo)
+}
+
+/// Mod Java vivo: registros pelo anel B e eventos de quebra de bloco medidos (intervalo padrão 1 ms).
+fn run_host(args: &Args, shared: &Shared, file: &Path, jar: &Path) -> Res<String> {
+    shared.reset();
+    let java_version = report::java_version(&args.java)?;
+    let gap = Duration::from_micros(args.gap_us.unwrap_or(1000));
+    let mut side = Side::spawn(&args.java, &args.sidecar_cp, file, Some(jar))?;
+    let result = host::run(&mut side, shared, args.iters, gap)?;
+    host::check_gem(&result.items)?;
+    host::finish(side, shared)?;
+    Ok(host::render(&result, gap, &java_version))
 }

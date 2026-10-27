@@ -33,18 +33,21 @@ public final class ModHost {
             System.err.println("usage: ModHost <mod.jar> <content.jar>");
             System.exit(2);
         }
-        Path mod = Path.of(args[0]);
-        String manifest = readManifest(mod);
-        String id = first(ID, manifest, "id");
-        try (URLClassLoader loader = new URLClassLoader(new URL[] {mod.toUri().toURL()},
-                ModHost.class.getClassLoader())) {
-            for (String name : entrypoints(manifest)) {
-                Object entry = loader.loadClass(name).getDeclaredConstructor().newInstance();
-                ((ModInitializer) entry).onInitialize();
-            }
-        }
+        String id = load(Path.of(args[0]));
         write(Path.of(args[1]), id);
         System.out.println("registered " + ShimHost.entries().size() + " entries from " + id);
+    }
+
+    /** Runs the main entrypoints and returns the mod id. The class loader stays open: the mod's callbacks load classes later. */
+    static String load(Path mod) throws Exception {
+        String manifest = readManifest(mod);
+        String id = first(ID, manifest, "id");
+        URLClassLoader loader = new URLClassLoader(new URL[] {mod.toUri().toURL()}, ModHost.class.getClassLoader());
+        for (String name : entrypoints(manifest)) {
+            Object entry = loader.loadClass(name).getDeclaredConstructor().newInstance();
+            ((ModInitializer) entry).onInitialize();
+        }
+        return id;
     }
 
     private static String readManifest(Path jar) throws IOException {

@@ -10,6 +10,8 @@ import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.List;
+import java.util.function.Function;
 
 /** Sidecar P3 (lado Java, modo echo). Protocolo em mods-java/PROTOCOLO.md, adendo v1.1. */
 public final class Sidecar {
@@ -96,10 +98,13 @@ public final class Sidecar {
         private long outTail;
         private long idleSince = NOT_IDLE;
         private boolean eof;
+        /** null = echo; senão recebe cada registro de A e devolve a resposta para B (ou null). */
+        private final Function<byte[], byte[]> handler;
 
-        Relay(MemorySegment seg, InputStream wake) {
+        Relay(MemorySegment seg, InputStream wake, Function<byte[], byte[]> handler) {
             this.seg = seg;
             this.wake = wake;
+            this.handler = handler;
             this.cap = getInt(seg, OFF_CAP) & 0xFFFFFFFFL;
             this.in = new Ring(seg, HEADER);
             this.out = new Ring(seg, HEADER + CTRL + cap);
@@ -143,8 +148,37 @@ public final class Sidecar {
             check(len >= 0 && len <= cap - REC_HDR, "tamanho de registro invalido: " + len);
             long rec = recordSize(len);
             check(pos + rec <= cap && inHead + rec <= tailIn, "registro fora do anel publicado");
-            forward(in.dataAt(pos), rec);
+            if (handler == null) {
+                forward(in.dataAt(pos), rec);
+            } else {
+                byte[] msg = new byte[len];
+                MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, in.dataAt(pos) + REC_HDR, msg, 0, len);
+                byte[] reply = handler.apply(msg);
+                if (reply != null) {
+                    emit(reply);
+                }
+            }
             return inHead + rec;
+        }
+
+        /** Grava um registro novo em B (resposta ou registro do host); o tail só é publicado ao fim do lote. */
+        void emit(byte[] payload) {
+            long rec = recordSize(payload.length);
+            long pos = outTail % cap;
+            long pad = pos + rec > cap ? cap - pos : 0;
+            awaitFree(pad + rec);
+            if (pad > 0) {
+                setInt(seg, out.dataAt(pos), SKIP);
+                outTail += pad;
+                pos = 0;
+            }
+            setInt(seg, out.dataAt(pos), payload.length);
+            MemorySegment.copy(payload, 0, seg, ValueLayout.JAVA_BYTE, out.dataAt(pos) + REC_HDR, payload.length);
+            outTail += rec;
+        }
+
+        void publish() {
+            out.storeTail(outTail);
         }
 
         /** Copia um registro para B; se não cabe até o fim, grava o marcador de pulo e vai para 0. */
@@ -239,8 +273,9 @@ public final class Sidecar {
     }
 
     static void serve(String[] args) throws IOException {
-        if (args.length != 2 || !"echo".equals(args[1])) {
-            throw new IllegalArgumentException("uso: java -cp out Sidecar <arquivo-mapeado> echo");
+        boolean host = args.length == 3 && "host".equals(args[1]);
+        if (!host && (args.length != 2 || !"echo".equals(args[1]))) {
+            throw new IllegalArgumentException("uso: java -cp out Sidecar <arquivo-mapeado> echo | host <mod.jar>");
         }
         try (FileChannel ch = FileChannel.open(Path.of(args[0]), StandardOpenOption.READ, StandardOpenOption.WRITE);
              Arena arena = Arena.ofShared()) {
@@ -250,7 +285,11 @@ public final class Sidecar {
                 throw new IllegalArgumentException("arquivo com " + ch.size() + " bytes; cabecalho exige " + size);
             }
             MemorySegment seg = ch.map(FileChannel.MapMode.READ_WRITE, 0, size, arena);
-            run(seg, System.in);
+            if (host) {
+                runHost(seg, System.in, args[2]);
+            } else {
+                run(seg, System.in);
+            }
         }
     }
 
@@ -281,7 +320,27 @@ public final class Sidecar {
     /** Sinaliza pronto (java_ready = 1) e roda o laço de echo até shutdown ou EOF com A vazio. */
     static void run(MemorySegment seg, InputStream wake) {
         storeIntVolatile(seg, OFF_READY, 1);
-        new Relay(seg, wake).loop();
+        new Relay(seg, wake, null).loop();
+    }
+
+    /**
+     * Modo host: carrega o mod (classes horizon.LiveHost do shim, por reflexão), envia os registros dele
+     * em B, só então sinaliza pronto e passa a despachar os eventos de A para o mod.
+     */
+    @SuppressWarnings("unchecked")
+    static void runHost(MemorySegment seg, InputStream wake, String modJar) {
+        try {
+            Class<?> live = Class.forName("horizon.LiveHost");
+            List<byte[]> registrations = (List<byte[]>) live.getMethod("open", String.class).invoke(null, modJar);
+            Function<byte[], byte[]> handler = (Function<byte[], byte[]>) live.getMethod("handler").invoke(null);
+            Relay relay = new Relay(seg, wake, handler);
+            registrations.forEach(relay::emit);
+            relay.publish();
+            storeIntVolatile(seg, OFF_READY, 1);
+            relay.loop();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("mod nao carregou: " + e, e);
+        }
     }
 
     /** Tamanho do registro: u32 len + payload, arredondado para múltiplo de 8. */

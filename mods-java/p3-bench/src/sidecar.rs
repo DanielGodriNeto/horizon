@@ -23,14 +23,15 @@ pub struct Side {
 }
 
 impl Side {
-    /// Lança `<java> -XX:+UseSerialGC -Xmx64m -Xshare:auto -cp <cp> Sidecar <arquivo> echo`, stdin em pipe (despertar).
-    pub fn spawn(java: &Path, cp: &Path, file: &Path) -> Res<Side> {
-        let mut child = Command::new(java)
-            .args(JVM_FLAGS)
-            .arg(cp)
-            .arg("Sidecar")
-            .arg(file)
-            .arg("echo")
+    /// Lança `<java> -XX:+UseSerialGC -Xmx64m -Xshare:auto -cp <cp> Sidecar <arquivo> echo` (ou `host <mod.jar>`), stdin em pipe (despertar).
+    pub fn spawn(java: &Path, cp: &Path, file: &Path, host_jar: Option<&Path>) -> Res<Side> {
+        let mut command = Command::new(java);
+        command.args(JVM_FLAGS).arg(cp).arg("Sidecar").arg(file);
+        match host_jar {
+            Some(jar) => command.arg("host").arg(jar),
+            None => command.arg("echo"),
+        };
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

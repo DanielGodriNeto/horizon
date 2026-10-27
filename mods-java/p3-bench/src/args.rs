@@ -11,6 +11,8 @@ pub struct Args {
     /// Intervalo entre viagens em µs; presente = modo gap (lotes 1..1000).
     pub gap_us: Option<u64>,
     pub out: Option<PathBuf>,
+    /// Presente = modo host: mod Java vivo sobre o anel em vez do bench de eco.
+    pub host_jar: Option<PathBuf>,
 }
 
 pub fn parse(mut argv: impl Iterator<Item = String>) -> Res<Args> {
@@ -20,6 +22,7 @@ pub fn parse(mut argv: impl Iterator<Item = String>) -> Res<Args> {
     let mut iters = 20_000;
     let mut gap_us = None;
     let mut out = None;
+    let mut host_jar = None;
     while let Some(flag) = argv.next() {
         let value = argv.next().ok_or_else(|| format!("{flag} sem valor"))?;
         match flag.as_str() {
@@ -28,6 +31,7 @@ pub fn parse(mut argv: impl Iterator<Item = String>) -> Res<Args> {
             "--pipe-cp" => pipe_cp = Some(PathBuf::from(value)),
             "--iters" => iters = value.parse()?,
             "--gap-us" => gap_us = Some(value.parse()?),
+            "--host-jar" => host_jar = Some(PathBuf::from(value)),
             "--out" => out = Some(PathBuf::from(value)),
             other => return Err(format!("argumento desconhecido: {other}").into()),
         }
@@ -42,5 +46,6 @@ pub fn parse(mut argv: impl Iterator<Item = String>) -> Res<Args> {
         iters,
         gap_us,
         out,
+        host_jar,
     })
 }
