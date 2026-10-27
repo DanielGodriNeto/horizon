@@ -156,6 +156,8 @@ mod scoreboard;
 mod screens;
 mod sculk;
 mod sculk_fixture;
+#[cfg(feature = "foreign")]
+mod java_mods;
 mod server_mods;
 mod server_packs;
 mod server_travel;
@@ -1611,6 +1613,8 @@ struct Game<'a> {
     extras: extras::ExtrasState,
     /// Horizon mods (`game/mods.rs`), none running unless turned on.
     mods: mods::ModsState,
+    #[cfg(feature = "foreign")]
+    java_mods: Option<java_mods::JavaBridge>,
     /// Horizon's own shader pack, while one is picked (`game/native_shaders.rs`).
     native_shaders: native_shaders::NativeShaders,
     /// Meshed sections waiting for an upload budget (Horizon settings).
@@ -3551,6 +3555,8 @@ impl Game<'_> {
         });
         if removed {
             self.mod_block_event(pos, broken, false);
+            #[cfg(feature = "foreign")]
+            self.java_mod_block_break(pos, broken);
         }
         if removed && !creative {
             let held = self.held().cloned();
@@ -4441,6 +4447,8 @@ impl Game<'_> {
         self.tick_command_extras();
         self.tick_mods();
         self.tick_server_mods();
+        #[cfg(feature = "foreign")]
+        self.tick_java_mods();
         let camera_eye = self.camera_eye_height();
         let stick = self.pad_move();
         if self.riding.is_some() && self.player.is_some() {
@@ -12896,6 +12904,8 @@ impl<'a> Game<'a> {
             frame_graph: Default::default(),
             extras: Default::default(),
             mods: Default::default(),
+            #[cfg(feature = "foreign")]
+            java_mods: None,
             native_shaders: Default::default(),
             sky_darken_memo: Default::default(),
             persist: Default::default(),
