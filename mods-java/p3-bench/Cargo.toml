@@ -1,0 +1,11 @@
+[package]
+name = "p3-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+memmap2 = "=0.9.11"
+
+# Workspace próprio: o bench não entra no workspace da raiz do repo.
+[workspace]
