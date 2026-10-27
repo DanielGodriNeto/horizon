@@ -773,7 +773,7 @@ fn creation_flags(_: &mut Command) {}
 fn watchdog_script(parent: u32, pid: u32) -> String {
     if cfg!(windows) {
         format!(
-            "Wait-Process -Id {parent} -ErrorAction SilentlyContinue;              if ((Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine -like '*{MARKER}*')              {{ Stop-Process -Id {pid} -Force }}"
+            "Wait-Process -Id {parent} -ErrorAction SilentlyContinue;              if ((Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine -like '*{MARKER}*')              {{ taskkill /PID {pid} /T /F }}"
         )
     } else {
         format!(
@@ -881,6 +881,10 @@ impl ModsServer {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        if matches!(self.child.try_wait(), Ok(None)) {
+            // The java found may be a launcher shim that spawned the real one: end the whole tree.
+            kill_pid(self.child.id());
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(mut watchdog) = self.watchdog.take() {
@@ -924,7 +928,7 @@ fn kill_pid(pid: u32) {
     #[cfg(windows)]
     {
         let mut command = Command::new("taskkill");
-        command.args(["/PID", &pid.to_string(), "/F"]);
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
         creation_flags(&mut command);
         let _ = command.output();
     }
