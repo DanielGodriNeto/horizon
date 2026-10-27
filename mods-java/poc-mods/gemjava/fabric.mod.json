@@ -1,0 +1,2 @@
+{"schemaVersion":1,"id":"gemjava","version":"1.0.0","name":"Gem Java","environment":"*",
+ "entrypoints":{"main":["dev.horizon.gemjava.GemMod"]}}

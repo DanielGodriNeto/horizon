@@ -2,3 +2,5 @@ target/
 pipe-out/
 out/
 __pycache__/
+out-shim/
+out-mod/

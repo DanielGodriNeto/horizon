@@ -934,3 +934,28 @@ fn fabric_data_jar_loads_into_content_root() {
     assert!(ids.get("minecraft:item").unwrap().id("gemdata:gem").is_some());
     let _ = fs::remove_dir_all(&scratch);
 }
+
+/// The content jar the Java shim host wrote for our own test mod
+/// (`HORIZON_SHIM_JAR`, built by mods-java/build-shim.cmd) gives the game its item.
+#[cfg(feature = "foreign")]
+#[test]
+fn shim_host_jar_gives_the_item() {
+    let (Some(base), Some(jar)) = (prepared(), std::env::var_os("HORIZON_SHIM_JAR")) else {
+        return;
+    };
+    let jar = PathBuf::from(jar);
+    let package = horizon_mods::Package::read(&jar).unwrap();
+    let content = Content::read(&jar, &package.manifest).unwrap();
+    let m = ContentMod {
+        id: package.manifest.id.clone(),
+        content,
+    };
+    let scratch = std::env::temp_dir().join(format!("horizon-shim-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let relative = Path::new("../../.local/horizon-client/26.3");
+    let root = resource_root(relative, std::slice::from_ref(&m), &scratch).unwrap();
+    assert_ne!(root, base);
+    let ids = horizon_protocol::registry::Builtin::load(&root.join("registries.json")).unwrap();
+    assert!(ids.get("minecraft:item").unwrap().id("gemjava:gem").is_some());
+    let _ = fs::remove_dir_all(&scratch);
+}
