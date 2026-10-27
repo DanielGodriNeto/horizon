@@ -98,6 +98,7 @@ pub struct ModsServer {
     dir: PathBuf,
     /// Held while the server runs; the OS drops it with the process, however Horizon ends.
     _lock: Option<FolderLock>,
+    watchdog: Option<Child>,
 }
 
 /// An exclusive OS lock on `<dir>/server.lock`: whoever holds it owns the folder's server and the
@@ -767,6 +768,38 @@ fn creation_flags(command: &mut Command) {
 #[cfg(not(windows))]
 fn creation_flags(_: &mut Command) {}
 
+/// The script of the watchdog: waits for Horizon (`parent`) to end, then kills the server `pid`
+/// if it still is our java (the marker guards against a reused PID).
+fn watchdog_script(parent: u32, pid: u32) -> String {
+    if cfg!(windows) {
+        format!(
+            "Wait-Process -Id {parent} -ErrorAction SilentlyContinue;              if ((Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine -like '*{MARKER}*')              {{ Stop-Process -Id {pid} -Force }}"
+        )
+    } else {
+        format!(
+            "while kill -0 {parent} 2>/dev/null; do sleep 1; done;              ps -p {pid} -o command= | grep -q -e '{MARKER}' && kill -9 {pid}"
+        )
+    }
+}
+
+/// Safe Rust has no Job Object or PR_SET_PDEATHSIG, so a tiny helper outlives a hard-killed Horizon
+/// and ends the server. Best effort: `shutdown` ends it on a clean stop.
+fn spawn_watchdog(pid: u32) -> Option<Child> {
+    let script = watchdog_script(std::process::id(), pid);
+    let mut command = if cfg!(windows) {
+        let mut c = Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", &script]);
+        c
+    };
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    creation_flags(&mut command);
+    command.spawn().map_err(|e| log::warn!("Horizon mods mode: no watchdog: {e}")).ok()
+}
+
 fn spawn_server(java: &Path, dir: &Path, config: &Config) -> Result<ModsServer, String> {
     let log = std::fs::File::create(dir.join("server.log")).map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
@@ -792,11 +825,13 @@ fn spawn_server(java: &Path, dir: &Path, config: &Config) -> Result<ModsServer, 
     PID.store(child.id(), Ordering::Relaxed);
     let _ = std::fs::write(dir.join("server.pid"), child.id().to_string());
     let stdin = child.stdin.take();
+    let watchdog = spawn_watchdog(child.id());
     Ok(ModsServer {
         child,
         stdin,
         dir: dir.to_owned(),
         _lock: None,
+        watchdog,
     })
 }
 
@@ -848,6 +883,10 @@ impl ModsServer {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(mut watchdog) = self.watchdog.take() {
+            let _ = watchdog.kill();
+            let _ = watchdog.wait();
+        }
         // Only our own PID: a later server may already own the slot.
         let _ = PID.compare_exchange(self.child.id(), 0, Ordering::Relaxed, Ordering::Relaxed);
         let _ = std::fs::remove_file(self.dir.join("server.pid"));
@@ -1027,6 +1066,12 @@ mod tests {
         drop(first);
         drop(lock_folder(&dir).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn watchdog_names_both_processes_and_checks_the_marker() {
+        let script = watchdog_script(111, 222);
+        assert!(script.contains("111") && script.contains("222") && script.contains(MARKER));
     }
 
     #[test]
@@ -1460,6 +1505,52 @@ mod live {
         std::thread::sleep(Duration::from_secs(1));
         assert!(!pid_alive(pid), "java left after stop");
         assert!(lock_folder(&root.join(FOLDER)).is_ok(), "lock not released");
+    }
+
+    /// The "Horizon" that gets killed in `hard_kill_of_horizon_ends_the_server`; a no-op on its own.
+    #[test]
+    #[ignore]
+    fn orphan_victim() {
+        if std::env::var_os("HORIZON_E2E_VICTIM").is_none() {
+            return;
+        }
+        start(&env_path("HORIZON_E2E_MODS"), &config(), &AtomicBool::new(false)).unwrap();
+        std::thread::sleep(Duration::from_secs(600));
+    }
+
+    /// Kills the process that owns the server with `taskkill /F` (no clean exit, no Drop): the
+    /// watchdog must end java, and the next start must find the folder free.
+    #[test]
+    #[ignore]
+    fn hard_kill_of_horizon_ends_the_server() {
+        let root = env_path("HORIZON_E2E_MODS");
+        let pid_file = root.join(FOLDER).join("server.pid");
+        let _ = std::fs::remove_file(&pid_file);
+        let mut victim = Command::new(std::env::current_exe().unwrap())
+            .args(["mods_server::live::orphan_victim", "--ignored", "--exact", "--nocapture"])
+            .env("HORIZON_E2E_VICTIM", "1")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let java = loop {
+            let ready = std::fs::read_to_string(root.join(FOLDER).join("server.log")).is_ok_and(|l| l.contains("Done ("));
+            if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|t| t.trim().parse::<u32>().ok()).filter(|_| ready) {
+                break pid;
+            }
+            assert!(started.elapsed() < Duration::from_secs(120), "victim never got the server up");
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        assert!(pid_alive(java));
+        kill_pid(victim.id());
+        let _ = victim.wait();
+        let killed = Instant::now();
+        while pid_alive(java) && killed.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        println!("java {java} gone {:?} after the kill: {}", killed.elapsed(), !pid_alive(java));
+        assert!(!pid_alive(java), "orphan java survived the kill");
+        assert!(lock_folder(&root.join(FOLDER)).is_ok(), "lock still held");
     }
 
     #[test]
