@@ -12,7 +12,9 @@
 //! items, `/browser` alone empties it) and registers the keys `recipe` (R)
 //! and `uses` (U); `/browser_poll` says what the player did on it;
 //! `/browser_recipes ID` shows the recipes making ID (`/browser_recipes`
-//! alone: the items again).
+//! alone: the items again). `/recipe_place ID [all]` places that recipe
+//! with `recipes.place`; `/recipe_give ITEM [COUNT]` gives with
+//! `recipes.give`.
 use horizon_mod_sdk::{
     Mod, Registration, browser, chat, command, game,
     input::{self, Event},
@@ -69,7 +71,11 @@ fn shapes() -> Vec<Shape> {
     ]
 }
 
-struct Guest;
+struct Guest {
+    /// `/recipe_place ID [all] later`: placed on the first tick a crafting
+    /// screen is open.
+    pending: Option<(i32, bool, String)>,
+}
 
 fn widgets() -> Vec<Widget> {
     vec![
@@ -106,6 +112,7 @@ impl Mod for Guest {
             "input_wheel",
             "zoom",
             "minimap",
+            "far_terrain",
             "raycast",
             "quiet",
             "quiet_many",
@@ -113,12 +120,15 @@ impl Mod for Guest {
             "browser",
             "browser_poll",
             "browser_recipes",
+            "recipe_place",
+            "recipe_give",
             "corner",
             "readings",
         ]
         .into_iter()
-        .fold(Registration::new(), Registration::command);
-        Ok((Guest, hooks))
+        .fold(Registration::new(), Registration::command)
+        .on_tick();
+        Ok((Guest { pending: None }, hooks))
     }
     fn command(&mut self, name: &str, args: &str) -> Result<Option<String>, String> {
         match name {
@@ -232,6 +242,15 @@ impl Mod for Guest {
                     round: words.get(3) == Some(&"1"),
                 });
                 render::set_minimap(map);
+            }
+            // `far_terrain off`, or `far_terrain DISTANCE REDUCED`.
+            "far_terrain" => {
+                let words: Vec<&str> = args.split(' ').collect();
+                let far = (args != "off").then(|| render::FarTerrain {
+                    distance: words.first().and_then(|w| w.parse().ok()).unwrap_or(0),
+                    reduced: words.get(1) == Some(&"1"),
+                });
+                render::set_far_terrain(far);
             }
             "quiet" => command::run_quiet(&args.split(';').map(str::to_owned).collect::<Vec<_>>()),
             "quiet_many" => {
@@ -385,6 +404,44 @@ impl Mod for Guest {
                 browser::set_recipes(&format!("Recipes for {args}"), &tabs, 0, &views);
                 chat::show(&format!("recipes shown: {}", views.len()));
             }
+            "recipe_place" => {
+                let mut words = args.split_whitespace();
+                let id = words.next().unwrap_or_default();
+                let rest: Vec<&str> = words.collect();
+                let all = rest.contains(&"all");
+                let book = recipes::all()
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.book_id);
+                if let Some(b) = book.filter(|_| rest.contains(&"later")) {
+                    self.pending = Some((b, all, id.to_owned()));
+                    chat::show(&format!("place {id}: waiting"));
+                    return Ok(None);
+                }
+                chat::show(&match book.map(|b| recipes::place(b, all)) {
+                    Some(Ok(())) => format!("place {id}: ok"),
+                    Some(Err(e)) => format!("place {id}: {e}"),
+                    None => format!("place {id}: no such recipe"),
+                });
+            }
+            "recipe_give" => {
+                let mut words = args.split_whitespace();
+                let id = words.next().unwrap_or_default();
+                let count = words.next().and_then(|c| c.parse().ok()).unwrap_or(1);
+                let item = recipes::items().iter().position(|i| i.id == id);
+                let result = item.map(|i| {
+                    recipes::give(&recipes::Stack {
+                        item: i as u32,
+                        count,
+                        components: String::new(),
+                    })
+                });
+                chat::show(&match result {
+                    Some(Ok(())) => format!("give {id}: ok"),
+                    Some(Err(e)) => format!("give {id}: {e}"),
+                    None => format!("give {id}: no such item"),
+                });
+            }
             "browser_poll" => {
                 let stack = |s: &browser::Stack| format!("{} x{}{}", s.item, s.count, s.components);
                 // A hook shows at most 8 chat lines: the count, then the first 7.
@@ -420,6 +477,15 @@ impl Mod for Guest {
             _ => {}
         }
         Ok(None)
+    }
+    fn tick(&mut self, _tick: u64) {
+        if let Some((book, all, id)) = self.pending.take() {
+            match recipes::place(book, all) {
+                Err(e) if e.starts_with("no screen") => self.pending = Some((book, all, id)),
+                Ok(()) => chat::show(&format!("place {id}: ok")),
+                Err(e) => chat::show(&format!("place {id}: {e}")),
+            }
+        }
     }
     fn ui_select(&mut self, id: u32, row: u32) {
         chat::show(&format!("selected {id}:{row}"));

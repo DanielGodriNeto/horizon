@@ -371,7 +371,10 @@ impl Game<'_> {
     }
     /// The chat's tree after the running mods changed.
     fn sync_mod_commands(&mut self) {
-        let mut names = self.mods.mods.commands().peekable();
+        // In-frame, the window runs server mods too: their names, free text
+        // here (the server parses their arguments).
+        let server = self.mods.mods.server_commands().map(|c| c.name.as_str());
+        let mut names = self.mods.mods.commands().chain(server).peekable();
         self.mods.tree = names
             .peek()
             .is_some()
@@ -474,6 +477,8 @@ impl Game<'_> {
             view_hit: self.mod_view_hit(),
             recipes,
             known_recipes,
+            placing: self.mod_recipe_screen(),
+            creative: self.creative,
         }
     }
     /// The first block along the player's view within
@@ -709,6 +714,18 @@ impl Game<'_> {
                 }
                 Output::Shake { strength, seconds } => {
                     self.mods.shake.add(strength, seconds);
+                    continue;
+                }
+                Output::PlaceRecipe { book_id, all } => {
+                    self.mod_place_recipe(book_id, all);
+                    continue;
+                }
+                Output::Give {
+                    item,
+                    count,
+                    components,
+                } => {
+                    self.mod_give(&item, count, &components);
                     continue;
                 }
                 Output::CloseScreen { owner } => {

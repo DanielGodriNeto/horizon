@@ -52,7 +52,9 @@ use bindings::{
     horizon::mods::{chat, command, game, hud, log as mod_log, storage},
 };
 pub use server_bindings::{
-    exports::horizon::mods::server_events::BlockPos,
+    exports::horizon::mods::server_events::{
+        Argument, ArgumentKind, ArgumentValue, BlockPos, ServerCommand,
+    },
     horizon::mods::players::{GameMode, Player as ServerPlayer},
     horizon::mods::world::BlockChange,
 };
@@ -76,9 +78,9 @@ use render_bindings::horizon::mods::input;
 pub use render_bindings::horizon::mods::input::{Event as InputEvent, HeldItem, ItemUse};
 /// What capability `render` asks the game to draw (WIT `interface render`).
 pub use render_bindings::horizon::mods::render::{
-    Corner as RenderCorner, FillShape, FrameRate, ItemShape, Minimap as ModMinimap,
-    Point as RenderPoint, QuadShape, Rect as RenderRect, Shape, SpriteShape, TextShape,
-    Zoom as ModZoom,
+    Corner as RenderCorner, FarTerrain as ModFarTerrain, FillShape, FrameRate, ItemShape,
+    Minimap as ModMinimap, Point as RenderPoint, QuadShape, Rect as RenderRect, Shape, SpriteShape,
+    TextShape, Zoom as ModZoom,
 };
 use render_bindings::{RenderHost, horizon::mods::render};
 /// Capability `recipes`'s imports (docs/mods.md): the game's recipes and items.
@@ -161,6 +163,10 @@ pub struct Snapshot {
     pub recipes: Option<Arc<Recipes>>,
     /// The `book-id`s of the recipes the player's book holds.
     pub known_recipes: Arc<[i32]>,
+    /// The open screen takes recipes (`recipes.place`).
+    pub placing: bool,
+    /// The player is in creative mode (`recipes.give`).
+    pub creative: bool,
 }
 
 /// Capability `recipes`'s tables: `items` in the registry's order, which
@@ -232,6 +238,15 @@ pub enum Output {
     CloseScreen { owner: usize },
     /// `render.shake`: strength 0 to 1, fading out over `seconds` (≤ 10).
     Shake { strength: f32, seconds: f32 },
+    /// `recipes.place`: the recipe book's click on this display id, all of
+    /// it when `all`.
+    PlaceRecipe { book_id: i32, all: bool },
+    /// `recipes.give`: a stack for a creative player.
+    Give {
+        item: String,
+        count: u32,
+        components: String,
+    },
 }
 
 /// The game's world as capability `world` reads it during a call: the
@@ -323,10 +338,10 @@ impl Hooks {
             Hooks::Client(..) => None,
         }
     }
-    fn commands(&self) -> &[String] {
+    fn commands(&self) -> Vec<&str> {
         match self {
-            Hooks::Client(_, r) => &r.commands,
-            Hooks::Server(_, r) => &r.commands,
+            Hooks::Client(_, r) => r.commands.iter().map(String::as_str).collect(),
+            Hooks::Server(_, r) => r.commands.iter().map(|c| c.name.as_str()).collect(),
         }
     }
 }
@@ -367,6 +382,8 @@ pub struct RecipePage {
 static BROWSER_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 /// Items a panel may hold, and events kept for `browser.poll`.
 const BROWSER_ITEMS: usize = 8192;
+/// `recipes.place` and `give` calls a hook call may make.
+const RECIPE_ACTIONS: usize = 36;
 /// Recipes `set-recipes` may show, slots in one, and stacks a slot cycles.
 const BROWSER_RECIPES: usize = 256;
 const RECIPE_SLOTS: usize = 9;
@@ -397,6 +414,8 @@ struct State {
     zoom: Option<ModZoom>,
     /// Capability `render`'s minimap, when the mod shows one.
     minimap: Option<ModMinimap>,
+    /// Capability `render`'s far terrain, when the mod draws one.
+    far_terrain: Option<ModFarTerrain>,
     input: InputState,
     browser: BrowserState,
     /// Capability `storage`'s folder; made on first `set`.
@@ -419,9 +438,16 @@ pub struct Mods {
     snapshot: Arc<Snapshot>,
     out: Vec<Output>,
     world: WorldSlot,
+    /// Moves on whenever a mod starts or stops: the game resends the server
+    /// mods' commands to players when it changes.
+    generation: u64,
 }
 
 impl Mods {
+    /// Changes whenever the running mods (so their commands) change.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
     /// Whether a running mod may use capability `world`: only then is a
     /// view worth lending.
     pub fn wants_world(&self) -> bool {
@@ -556,7 +582,8 @@ impl Mods {
             .iter()
             .filter_map(|e| e.run.as_ref())
             .filter(|r| r.hooks.server().is_some() == server)
-            .flat_map(|r| r.hooks.commands().iter().cloned())
+            .flat_map(|r| r.hooks.commands())
+            .map(str::to_owned)
             .collect();
         let snapshot = self.snapshot.clone();
         let world = self.world.clone();
@@ -591,6 +618,7 @@ impl Mods {
             corner: None,
             zoom: None,
             minimap: None,
+            far_terrain: None,
             input: InputState::default(),
             browser: BrowserState::default(),
             data_dir,
@@ -625,17 +653,30 @@ impl Mods {
                 .map_err(|e| reason(&e))??;
             (Hooks::Client(exports, r), ui)
         };
-        let commands = match &mut hooks {
-            Hooks::Client(_, r) => &mut r.commands,
-            Hooks::Server(_, r) => &mut r.commands,
-        };
-        commands.retain(|c| {
-            let free = !reserved(c) && !taken.contains(c);
+        let free = |c: &str| {
+            let free = !reserved(c) && !taken.iter().any(|t| t == c);
             if !free {
                 log::warn!("Horizon: mod {} cannot take /{c}: already a command", m.id);
             }
             free
-        });
+        };
+        match &mut hooks {
+            Hooks::Client(_, r) => r.commands.retain(|c| free(c)),
+            Hooks::Server(_, r) => {
+                r.commands.retain(|c| free(&c.name));
+                for c in &mut r.commands {
+                    if let Err(e) = check_arguments(&c.arguments) {
+                        log::warn!(
+                            "Horizon: mod {}'s /{}: {e}; it takes free text",
+                            m.id,
+                            c.name
+                        );
+                        c.arguments.clear();
+                    }
+                }
+            }
+        }
+        self.generation += 1;
         self.out.append(&mut store.data_mut().out);
         Ok(Some(Running {
             store,
@@ -753,6 +794,7 @@ impl Mods {
                 });
                 entry.status = Status::Failed(reason);
                 entry.run = None;
+                self.generation += 1;
                 None
             }
         }
@@ -777,7 +819,7 @@ impl Mods {
     fn command_owner(&self, server: bool, name: &str) -> Option<usize> {
         self.entries.iter().position(|e| {
             e.run.as_ref().is_some_and(|r| {
-                r.hooks.server().is_some() == server && r.hooks.commands().iter().any(|c| c == name)
+                r.hooks.server().is_some() == server && r.hooks.commands().contains(&name)
             })
         })
     }
@@ -810,7 +852,7 @@ impl Mods {
             .iter()
             .filter_map(|e| e.run.as_ref())
             .filter(move |r| r.hooks.server().is_some() == server)
-            .flat_map(|r| r.hooks.commands().iter().map(String::as_str))
+            .flat_map(|r| r.hooks.commands())
     }
 
     /// A server tick.
@@ -853,9 +895,13 @@ impl Mods {
             |m, s| m.call_block_placed(s, player, pos, state),
         );
     }
-    /// The commands running server mods own, for the server's command tree.
-    pub fn server_commands(&self) -> impl Iterator<Item = &str> {
-        self.owned_commands(true)
+    /// The commands running server mods own and their arguments, for the
+    /// server's command tree.
+    pub fn server_commands(&self) -> impl Iterator<Item = &ServerCommand> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.run.as_ref()?.hooks.server())
+            .flat_map(|r| r.commands.iter())
     }
     /// Runs `line` (without its slash), typed by `player`, if a server mod
     /// owns its command; its feedback is an [`Output::Reply`]. False when
@@ -865,18 +911,35 @@ impl Mods {
         let Some(i) = self.command_owner(true, name) else {
             return false;
         };
-        let result = self.call(i, FUEL_EVENT, |run| match &run.hooks {
-            Hooks::Server(m, _) => {
-                m.horizon_mods_server_events()
-                    .call_command(&mut run.store, player, name, args)
-            }
-            Hooks::Client(..) => Ok(Ok(None)),
-        });
         let reply = |text, error| Output::Reply {
             player: player.id.clone(),
             text,
             error,
         };
+        let arguments = self.entries[i]
+            .run
+            .as_ref()
+            .and_then(|r| r.hooks.server())
+            .and_then(|r| r.commands.iter().find(|c| c.name == name))
+            .map(|c| c.arguments.as_slice())
+            .unwrap_or_default();
+        let values = match crate::commands::parse(arguments, args, player, &self.snapshot.players) {
+            Ok(values) => values,
+            Err(e) => {
+                self.out.push(reply(e, true));
+                return true;
+            }
+        };
+        let result = self.call(i, FUEL_EVENT, |run| match &run.hooks {
+            Hooks::Server(m, _) => m.horizon_mods_server_events().call_command(
+                &mut run.store,
+                player,
+                name,
+                args,
+                &values,
+            ),
+            Hooks::Client(..) => Ok(Ok(None)),
+        });
         match result {
             Some(Ok(Some(text))) => self.out.push(reply(text, false)),
             Some(Err(text)) => self.out.push(reply(text, true)),
@@ -1110,6 +1173,12 @@ impl Mods {
             .iter()
             .find_map(|e| e.run.as_ref()?.store.data().minimap)
     }
+    /// The far terrain the first running mod draws (capability `render`).
+    pub fn far_terrain(&self) -> Option<ModFarTerrain> {
+        self.entries
+            .iter()
+            .find_map(|e| e.run.as_ref()?.store.data().far_terrain)
+    }
     fn inputs(&self) -> impl Iterator<Item = &InputState> {
         self.entries
             .iter()
@@ -1202,6 +1271,7 @@ impl Mods {
                 continue;
             }
             any = true;
+            self.generation += 1;
             self.entries[i].modified = now;
             self.entries[i].run = None;
             let path = self.entries[i].path.clone();
@@ -1225,6 +1295,34 @@ impl Mods {
         }
         any
     }
+}
+
+/// A command's arguments are well formed: names given and distinct,
+/// optional ones last, free text only last.
+fn check_arguments(arguments: &[Argument]) -> Result<(), String> {
+    for (i, a) in arguments.iter().enumerate() {
+        if a.name.is_empty()
+            || !a
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(format!("argument name '{}' isn't [A-Za-z0-9_]+", a.name));
+        }
+        if arguments[..i].iter().any(|b| b.name == a.name) {
+            return Err(format!("two arguments are named {}", a.name));
+        }
+        if i > 0 && arguments[i - 1].optional && !a.optional {
+            return Err(format!("{} is required after an optional argument", a.name));
+        }
+        if a.kind == ArgumentKind::Text && i + 1 < arguments.len() {
+            return Err(format!(
+                "{} takes the rest of the line, so it must be last",
+                a.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -1383,6 +1481,54 @@ impl recipes::Host for State {
     }
     fn known(&mut self) -> Vec<i32> {
         self.snapshot.known_recipes.to_vec()
+    }
+    fn place(&mut self, book_id: i32, all: bool) -> Result<(), String> {
+        self.recipe_action()?;
+        if !self.snapshot.placing {
+            return Err("no screen that takes recipes is open".into());
+        }
+        if !self.snapshot.known_recipes.contains(&book_id) {
+            return Err(format!(
+                "recipe {book_id} is not in the player's recipe book"
+            ));
+        }
+        self.out.push(Output::PlaceRecipe { book_id, all });
+        Ok(())
+    }
+    fn give(&mut self, stack: RecipeStack) -> Result<(), String> {
+        self.recipe_action()?;
+        if !self.snapshot.creative {
+            return Err("only in creative mode".into());
+        }
+        let item = self
+            .snapshot
+            .recipes
+            .as_ref()
+            .and_then(|r| r.items.get(stack.item as usize))
+            .ok_or_else(|| format!("no item {}", stack.item))?
+            .id
+            .clone();
+        self.out.push(Output::Give {
+            item,
+            count: stack.count.clamp(1, 99),
+            components: clip_to(stack.components, 4096),
+        });
+        Ok(())
+    }
+}
+impl State {
+    /// `recipes.place` and `give` take at most [`RECIPE_ACTIONS`] a call.
+    fn recipe_action(&self) -> Result<(), String> {
+        let done = self
+            .out
+            .iter()
+            .filter(|o| matches!(o, Output::PlaceRecipe { .. } | Output::Give { .. }))
+            .count();
+        if done < RECIPE_ACTIONS {
+            Ok(())
+        } else {
+            Err(format!("at most {RECIPE_ACTIONS} places and gives a call"))
+        }
     }
 }
 impl State {
@@ -1586,6 +1732,8 @@ const TURN_MIN: f32 = 0.05;
 /// `set-minimap`'s side in GUI pixels and its blocks per map pixel.
 const MINIMAP_SIZE: (f32, f32) = (16.0, 256.0);
 const MINIMAP_SCALE: (f32, f32) = (0.5, 4.0);
+/// `set-far-terrain`'s distance in chunks, as the LOD Distance setting's.
+const FAR_TERRAIN_DISTANCE: (u32, u32) = (64, 1024);
 
 /// A mod's corner panel: shapes in a `width` × `height` box the game
 /// places in `corner`, stacked with the other overlays.
@@ -1673,6 +1821,14 @@ impl render::Host for State {
             size: finite(m.size, MINIMAP_SIZE.0, MINIMAP_SIZE.1),
             blocks_per_pixel: finite(m.blocks_per_pixel, MINIMAP_SCALE.0, MINIMAP_SCALE.1),
             ..m
+        });
+    }
+    fn set_far_terrain(&mut self, far_terrain: Option<ModFarTerrain>) {
+        self.far_terrain = far_terrain.map(|f| ModFarTerrain {
+            distance: f
+                .distance
+                .clamp(FAR_TERRAIN_DISTANCE.0, FAR_TERRAIN_DISTANCE.1),
+            ..f
         });
     }
     fn frame_stats(&mut self) -> FrameRate {
