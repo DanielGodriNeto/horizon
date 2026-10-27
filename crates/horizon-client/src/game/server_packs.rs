@@ -15,6 +15,7 @@ use horizon_client::{
     toasts::SystemToast,
     ui,
 };
+use horizon_client::mods_server;
 use horizon_core::jmath;
 use horizon_protocol::{packets::configuration::ResourcePackPush, servers};
 use std::{
@@ -205,6 +206,11 @@ impl Game<'_> {
             state.packs.local_world();
             return;
         };
+        if mods_server::is_local(address) {
+            state.address = Some(address.to_owned());
+            state.packs.connect(Prompt::for_server(Some(true)));
+            return;
+        }
         let file = multiplayer::servers_file(&saves());
         let entry = servers::load(&file).into_iter().find(|s| s.ip == address);
         let setting = entry.as_ref().and_then(|e| e.accept_textures);
@@ -225,7 +231,16 @@ impl Game<'_> {
             self.send_pack_status(p.id, action::INVALID_URL);
             return;
         }
-        let setting = self.server_setting();
+        let local = self
+            .server_packs
+            .address
+            .as_deref()
+            .is_some_and(mods_server::is_local);
+        let setting = if local && !mods_server::quiet_pack(&p.url) {
+            None
+        } else {
+            self.server_setting()
+        };
         let prompt = Prompt::for_server(setting);
         if prompt != Prompt::Pending && (!p.required || prompt != Prompt::Declined) {
             self.server_packs
@@ -256,6 +271,9 @@ impl Game<'_> {
     /// The joined server's entry in the server list: its `acceptTextures`.
     fn server_setting(&self) -> Option<bool> {
         let address = self.server_packs.address.as_deref()?;
+        if mods_server::is_local(address) {
+            return Some(true);
+        }
         servers::load(&multiplayer::servers_file(&saves()))
             .into_iter()
             .find(|s| s.ip == address)?

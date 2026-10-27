@@ -2,7 +2,7 @@
 //! SelectWorldScreen, CreateWorldScreen layouts), drawn as HUD quads.
 use crate::{
     hud::{HudAtlas, HudBatch, rgba},
-    lang,
+    lang, mods_server,
     save::Level,
     text::{Text, format_translation},
 };
@@ -101,10 +101,15 @@ pub enum Mode {
         return_to: Box<Mode>,
     },
     Multiplayer(crate::multiplayer::Screen),
+    /// `--mods-mode`: the warning to accept before the hidden mods server starts.
+    ModsWarning,
+    /// The hidden mods server is starting; Back cancels it.
+    ModsStarting,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     None,
+    ModsEnable,
     Quit,
     Options,
     Accessibility,
@@ -393,6 +398,15 @@ impl Title {
         let mut scroll = self.scroll.get();
         scroll.wheel(delta, ROW_HEIGHT / 2.0, top, bottom, content);
         self.scroll.set(scroll);
+    }
+    pub fn mods_warning(&mut self) {
+        self.mode = Mode::ModsWarning;
+    }
+    pub fn mods_starting(&mut self) {
+        self.mode = Mode::ModsStarting;
+    }
+    pub fn is_mods_starting(&self) -> bool {
+        matches!(self.mode, Mode::ModsStarting)
     }
     pub fn failed(&mut self, error: impl std::fmt::Display) {
         let return_to = Box::new(self.mode.clone());
@@ -788,6 +802,32 @@ impl Title {
                     ),
                 ]
             }
+            Mode::ModsWarning => vec![
+                b(
+                    (w / 2.0).floor() - 152.0,
+                    h.ceil() - 36.0,
+                    150.0,
+                    "Ativar modo com mods",
+                    true,
+                    71,
+                ),
+                b(
+                    (w / 2.0).floor() + 2.0,
+                    h.ceil() - 36.0,
+                    150.0,
+                    &lang::get_or("gui.cancel", "Cancel"),
+                    true,
+                    72,
+                ),
+            ],
+            Mode::ModsStarting => vec![b(
+                (w / 2.0).floor() - 75.0,
+                h.ceil() - 36.0,
+                150.0,
+                &lang::get_or("gui.back", "Back"),
+                true,
+                73,
+            )],
             Mode::Error { .. } => vec![b(
                 (w / 2.0).floor() - 75.0,
                 confirm_top(h, self.message_lines.get())
@@ -1072,6 +1112,28 @@ impl Title {
                 for (i, line) in lines.iter().enumerate() {
                     centered(atlas, batch, line, top + 17.0 + i as f32 * 9.0, u32::MAX);
                 }
+            }
+            Mode::ModsWarning => {
+                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+                centered(atlas, batch, mods_server::WARNING_TITLE, 14.0, u32::MAX);
+                let mut y = 30.0;
+                for text in mods_server::WARNING_LINES {
+                    for line in wrapped(atlas, text, w - 40.0) {
+                        centered(atlas, batch, &line, y, u32::MAX);
+                        y += 9.0;
+                    }
+                    y += 2.0;
+                }
+            }
+            Mode::ModsStarting => {
+                crate::ui::menu_background(batch, atlas, 0.0, 0.0, w, h, false);
+                centered(
+                    atlas,
+                    batch,
+                    "Iniciando o servidor de mods...",
+                    confirm_top(h, 1) + 17.0,
+                    u32::MAX,
+                );
             }
             Mode::Backup { .. } => {
                 self.backup_shown.set(true);
@@ -1381,6 +1443,11 @@ impl Title {
             }
             (Mode::Delete { .. }, Some(38)) => {
                 self.escape();
+                Action::None
+            }
+            (Mode::ModsWarning, Some(71)) => Action::ModsEnable,
+            (Mode::ModsWarning, Some(72)) | (Mode::ModsStarting, Some(73)) => {
+                self.mode = Mode::Main;
                 Action::None
             }
             (Mode::Error { return_to, .. }, Some(39)) => {

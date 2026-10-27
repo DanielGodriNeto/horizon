@@ -3,6 +3,7 @@
 use super::*;
 use horizon_client::{
     clipboard::{self, AppendSelection, SystemClipboard},
+    mods_server,
     options_ui::{Event, OptionsUi, Page},
 };
 use winit::{event::KeyEvent, keyboard::ModifiersState};
@@ -23,8 +24,17 @@ pub(super) struct StartupMenu {
     clipboard: SystemClipboard,
     selection: AppendSelection,
     pub pending: Option<PendingWorldEntry>,
+    /// `--mods-mode` was given and the mods server has not been started or declined yet.
+    mods_mode: bool,
+    mods_start: Option<ModsStart>,
     pub reload_packs: bool,
     pub perf: horizon_client::telemetry::Session,
+}
+
+/// The worker starting the hidden mods server; `cancel` stops it from Back or quit.
+struct ModsStart {
+    rx: std::sync::mpsc::Receiver<std::result::Result<u16, String>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StartupMenu {
@@ -49,6 +59,7 @@ impl StartupMenu {
         };
         let mut menu = Self {
             pending,
+            mods_mode: options.mods_mode && options.server.is_none() && options.world.is_none(),
             ..Default::default()
         };
         menu.root = options.resources.clone();
@@ -77,6 +88,79 @@ impl StartupMenu {
             );
             title.last_server = settings.file.string("lastServer");
             self.title = Some(title);
+            if self.mods_mode {
+                self.mods_mode = false;
+                if mods_server::Config::load(&Self::cwd()).is_accepted() {
+                    self.begin_mods_start();
+                } else if let Some(title) = &mut self.title {
+                    title.mods_warning();
+                }
+            }
+        }
+    }
+
+    fn cwd() -> PathBuf {
+        std::env::current_dir().unwrap_or_default()
+    }
+
+    /// Starts the server on a worker thread; `poll_mods_start` collects the result.
+    fn begin_mods_start(&mut self) {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let flag = cancel.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mods-server".into())
+            .spawn(move || {
+                let root = Self::cwd();
+                let config = mods_server::Config::load(&root);
+                let _ = tx.send(mods_server::start(&root, &config, &flag));
+            });
+        match spawned {
+            Ok(_) => {
+                if let Some(title) = &mut self.title {
+                    title.mods_starting();
+                }
+                self.mods_start = Some(ModsStart { rx, cancel });
+            }
+            Err(error) => {
+                if let Some(title) = &mut self.title {
+                    title.failed(format!("Servidor de mods: {error}"));
+                }
+            }
+        }
+    }
+
+    /// Per frame: cancel when the user left the waiting screen, else enter the world on success.
+    fn poll_mods_start(&mut self, player_name: String) {
+        let Some(start) = &self.mods_start else { return };
+        let waiting = self.title.as_ref().is_some_and(|t| t.is_mods_starting());
+        if !waiting {
+            start.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.mods_start = None;
+            return;
+        }
+        let result = match start.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("o servidor de mods parou de forma inesperada".into())
+            }
+        };
+        self.mods_start = None;
+        match result {
+            Ok(port) => {
+                self.pending = Some(PendingWorldEntry::Server {
+                    address: format!("127.0.0.1:{port}"),
+                    name: player_name,
+                    cookies: None,
+                });
+                self.perf.world_opening();
+            }
+            Err(message) => {
+                if let Some(title) = &mut self.title {
+                    title.failed(format!("Servidor de mods: {message}. Modo normal."));
+                }
+            }
         }
     }
 
@@ -422,6 +506,16 @@ impl Loading {
             Action::Options => self.open_menu_options(Page::Main),
             Action::Accessibility => self.open_menu_options(Page::Accessibility),
             Action::Language => self.open_menu_options(Page::Language),
+            Action::ModsEnable => {
+                match mods_server::Config::save_accepted(&StartupMenu::cwd()) {
+                    Ok(()) => self.menu.begin_mods_start(),
+                    Err(error) => {
+                        if let Some(title) = &mut self.menu.title {
+                            title.failed(format!("Servidor de mods: {error}"));
+                        }
+                    }
+                }
+            }
             action => {
                 let name = self
                     .options
@@ -605,6 +699,8 @@ impl Loading {
     }
 
     pub(super) fn draw_menu(&mut self, batch: &mut HudBatch) {
+        let name = self.options.as_ref().map_or_else(|| "Player".into(), |o| o.player_name());
+        self.menu.poll_mods_start(name);
         let Some(gui) = &self.gui else { return };
         if self.menu.pending.is_some() {
             horizon_client::level_loading::draw_progress(

@@ -414,6 +414,7 @@ pub fn install(home: PathBuf, side: &'static str) {
         default(info);
         let main = std::thread::current().name() == Some("main");
         if main {
+            crate::mods_server::stop_global();
             deliver(&home, panic_report(info, side));
         } else {
             log::error!(

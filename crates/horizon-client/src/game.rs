@@ -275,6 +275,8 @@ struct Options {
     seed: i64,
     creative: bool,
     test_terrain: bool,
+    /// `--mods-mode`: opt in to the hidden local Fabric server (see `mods_server`).
+    mods_mode: bool,
     frames: Option<u64>,
     /// `--world-frames N`: exit after N frames drawn in the world (smoke runs; the world may load slowly).
     world_frames: Option<u64>,
@@ -344,6 +346,7 @@ impl Options {
             seed: 0,
             creative: false,
             test_terrain: false,
+            mods_mode: false,
             frames: None,
             world_frames: None,
             screenshot_after: None,
@@ -389,6 +392,7 @@ impl Options {
                 }
                 "--creative" => o.creative = true,
                 "--test-terrain" => o.test_terrain = true,
+                "--mods-mode" => o.mods_mode = true,
                 "--no-pause" => o.no_pause = true,
                 "--offscreen" => o.offscreen = true,
                 "--control" => o.control = Some(horizon_client::control::default_path()),
@@ -11944,7 +11948,7 @@ impl ApplicationHandler for Game<'_> {
                         Action::Connect { address } => {
                             self.connect_server(&address, &self.options.player_name())?
                         }
-                        Action::None => {}
+                        Action::None | Action::ModsEnable => {}
                     }
                 }
                 WindowEvent::MouseInput { .. } if self.title.is_some() => {}
@@ -12573,6 +12577,7 @@ impl ApplicationHandler for Game<'_> {
     /// applicationWillTerminate without a CloseRequested; vanilla's GLFW
     /// window turns it into a window close, so Minecraft.stop saves the world.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        horizon_client::mods_server::stop_global();
         self.pad_close_output();
         if let Err(e) = self.save_for_exit() {
             log::warn!("Horizon: failed to save the world on exit: {e}");
@@ -14191,6 +14196,7 @@ impl ApplicationHandler for App {
         }
     }
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        horizon_client::mods_server::stop_global();
         if let App::Ready(game) = self {
             game.exiting(event_loop);
         }
@@ -14295,6 +14301,17 @@ pub fn run() -> Result<()> {
     Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
     if !synchronous_startup(&options) {
         return run_loading(options, early_settings, vanilla_root, None, started);
+    }
+    if options.mods_mode && options.server.is_none() && options.world.is_none() {
+        // Automation (--control, --frames, ...) has no warning screen: the acceptance must
+        // already be in horizon-mods-server.txt.
+        let root = std::env::current_dir()?;
+        let config = horizon_client::mods_server::Config::load(&root);
+        if !config.is_accepted() {
+            return Err("--mods-mode: accept the warning once in a normal launch first".into());
+        }
+        let port = horizon_client::mods_server::start(&root, &config, &Default::default())?;
+        options.server = Some(format!("127.0.0.1:{port}"));
     }
     let mut pack_error = None;
     options.resources = packs::startup_root(&vanilla_root, &early_settings.resource_packs, &[])
