@@ -68,15 +68,18 @@ public static class Sbx {
         IntPtr sid; if (DeriveAppContainerSidFromAppContainerName(name, out sid) != 0) throw new Exception("no profile");
         IntPtr caps = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SECURITY_CAPABILITIES)));
         Marshal.StructureToPtr(new SECURITY_CAPABILITIES { Sid = sid }, caps, false);
-        IntPtr size = IntPtr.Zero; InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+        IntPtr size = IntPtr.Zero; InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref size);
         IntPtr list = Marshal.AllocHGlobal(size);
-        if (!InitializeProcThreadAttributeList(list, 1, 0, ref size)) throw Fail(1);
+        if (!InitializeProcThreadAttributeList(list, 2, 0, ref size)) throw Fail(1);
         // PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
         if (!UpdateProcThreadAttribute(list, 0, (IntPtr)0x20009, caps, (IntPtr)Marshal.SizeOf(typeof(SECURITY_CAPABILITIES)), IntPtr.Zero, IntPtr.Zero)) throw Fail(2);
 
         var sa = new SECURITY_ATTRIBUTES { Length = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), Inherit = true };
         IntPtr outH = CreateFileW(log, 0x40000000, 1, ref sa, 2, 0x80, IntPtr.Zero); // GENERIC_WRITE, share read, CREATE_ALWAYS
         if (outH == (IntPtr)(-1)) throw Fail(3);
+        // PROC_THREAD_ATTRIBUTE_HANDLE_LIST: the child inherits the log handle and nothing else of ours.
+        IntPtr only = Marshal.AllocHGlobal(IntPtr.Size); Marshal.WriteIntPtr(only, outH);
+        if (!UpdateProcThreadAttribute(list, 0, (IntPtr)0x20002, only, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) throw Fail(6);
         var si = new STARTUPINFOEX();
         si.Info.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
         si.Info.Flags = 0x100; // STARTF_USESTDHANDLES
