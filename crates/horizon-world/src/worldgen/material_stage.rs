@@ -200,6 +200,7 @@ pub fn build_surface<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlock
 where
     R::Positional: Clone,
 {
+    let _prof = horizon_core::prof::scope(horizon_core::prof::Slot::BuildSurface);
     let min = chunk.min_y();
     let max = min + chunk.height() - 1;
     if inputs.write_min_y < min

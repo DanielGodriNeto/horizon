@@ -98,6 +98,8 @@ mods = ["horizon-mods/runtime"]
 foreign = ["horizon-mods/foreign"]
 # Records the call sites of mob random draws (`mob_ai_probe` traces).
 rng-trace = ["horizon-core/rng-trace"]
+# Times the worldgen's inner stages for `cpu_bench` (horizon-core `prof`).
+prof = ["horizon-core/prof"]
 
 # Its own name, not `probe`: Cargo copies every crate's examples into one target/<profile>/examples.
 [[example]]

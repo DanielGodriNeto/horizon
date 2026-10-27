@@ -9,6 +9,8 @@ description = "Horizon simulation foundations for the pinned vanilla Java Editio
 [features]
 # Records the call sites of LegacyRandom draws (mob AI parity debugging).
 rng-trace = []
+# Wall-time counters for worldgen stages (prof.rs); empty guards without it.
+prof = []
 
 [dependencies]
 libm = "=0.2.16"

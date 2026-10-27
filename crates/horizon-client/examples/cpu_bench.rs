@@ -67,7 +67,7 @@ fn generate(
     terrain: &VanillaTerrain,
     center: (i32, i32),
     radius: i32,
-    times: &mut [Duration; 8],
+    times: &mut [Duration; 11],
 ) -> Result<Columns, Error> {
     let mut worker = terrain.worker();
     let mut protos: HashMap<(i32, i32), Proto> = HashMap::new();
@@ -88,6 +88,11 @@ fn generate(
         stages.carvers,
     ]) {
         *slot += d;
+    }
+    // Finer slices of the stages above, counted by horizon-core's `prof` (all zero
+    // unless built with `--features prof`); drained here so decoration is not in them.
+    for (slot, ns) in times[8..].iter_mut().zip(horizon_core::prof::take()) {
+        *slot += Duration::from_nanos(ns);
     }
     for (x, z) in square(center, radius + 1) {
         let keys: [(i32, i32); 9] =
@@ -171,6 +176,9 @@ fn main() -> Result<(), Error> {
         "  surface",
         "  structures",
         "  carvers",
+        "  fill_noise",
+        "  sample_volume",
+        "  build_surface",
         "gen_decorate",
         "gen_finish",
         "light",
@@ -188,7 +196,7 @@ fn main() -> Result<(), Error> {
     // Round 0 warms up the process (page faults, lazy tables) and is not counted.
     for round in 0..=rounds.max(1) {
         let terrain = VanillaTerrain::new(&root.join("worldgen"), assets.registry, &biomes, seed)?;
-        let mut gen_times = [Duration::ZERO; 8];
+        let mut gen_times = [Duration::ZERO; 11];
         let mut columns = generate(&terrain, center, radius, &mut gen_times)?;
         let mut hash = DefaultHasher::new();
         for key in square(center, radius) {
@@ -298,6 +306,9 @@ fn main() -> Result<(), Error> {
             gen_times[5],
             gen_times[6],
             gen_times[7],
+            gen_times[8],
+            gen_times[9],
+            gen_times[10],
             gen_times[1],
             gen_times[2],
             light_time,
@@ -332,6 +343,9 @@ fn main() -> Result<(), Error> {
     }
     let proto = ("column", square(center, radius + 2).len());
     let units = [
+        proto,
+        proto,
+        proto,
         proto,
         proto,
         proto,

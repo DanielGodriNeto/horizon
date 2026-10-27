@@ -467,6 +467,7 @@ pub fn fill_noise<B: TerrainBlockStates>(
     aquifer: &mut (impl TerrainAquifer + ?Sized),
     default_block: BlockStateId,
 ) -> Result<(), TerrainError> {
+    let _prof = horizon_core::prof::scope(horizon_core::prof::Slot::FillNoise);
     let [sx, sy, sz] = volume.sizes();
     let [bx, by, bz] = volume.minimum();
     if sx != 16
@@ -483,7 +484,10 @@ pub fn fill_noise<B: TerrainBlockStates>(
     chunk.ensure_heightmap(HeightmapType::OceanFloorWg);
     chunk.ensure_heightmap(HeightmapType::WorldSurfaceWg);
     let mut density = vec![0.; volume.size()];
-    final_density.sample_volume(context, &mut density, volume)?;
+    {
+        let _prof = horizon_core::prof::scope(horizon_core::prof::Slot::SampleVolume);
+        final_density.sample_volume(context, &mut density, volume)?;
+    }
     const MAPS: [HeightmapType; 2] = [HeightmapType::OceanFloorWg, HeightmapType::WorldSurfaceWg];
     let air_from = aquifer.air_from().unwrap_or(i32::MAX);
     for z in 0..sz {

@@ -11,6 +11,7 @@ pub mod geometry;
 pub mod jmath;
 pub mod no_ai;
 pub mod noise;
+pub mod prof;
 pub mod paletted;
 pub mod position;
 pub mod random;
