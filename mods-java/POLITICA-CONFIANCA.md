@@ -15,3 +15,6 @@ abre rede e roda processos com os direitos do usuário. Hoje só roda o mod noss
 6. **Primeiros candidatos** (sem mixin, só API pública): `fabric-permissions-api`, `cloth-config`. Mods com centenas de
    mixins (Carpet, Lithium, Ledger) ficam fora de escopo.
 7. **Revogação.** Remover a linha da lista desliga o mod no próximo boot; a ponte nunca reinicia sozinha um mod fora da lista.
+
+## Sandbox (implementado em `sandbox/sandbox.ps1`, para medição, ainda não ligado ao jogo)
+AppContainer sem capacidades (sem rede, nem loopback; sem acesso aos arquivos do usuário) + Job Object (kill-on-close, 1 processo, memória, timeout), env mínimo, HOME/tmp descartáveis, cwd vazio, tudo em pasta temporária removida ao final. A prova com um jar que tenta socket/leitura/escrita fora/spawn falha em todos. Não cobre: exploit de kernel, arquivos legíveis a todos, side channels, serviços ALPC, nem equivale a VM. Rodar mod de terceiro no jogo ainda exige este perfil mais a lista por hash.
