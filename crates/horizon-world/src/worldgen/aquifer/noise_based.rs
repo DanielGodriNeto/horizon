@@ -457,6 +457,13 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
         };
         Ok(2. * (barrier + q))
     }
+    /// From this height up, a position with density at or below zero is air
+    /// and clears the fluid-update flag, so callers may skip the call.
+    pub fn air_from(&self) -> Option<i32> {
+        self.picker
+            .air_from()
+            .map(|from| from.max(self.skip_above_y.saturating_add(1)))
+    }
     pub fn compute_substance(
         &mut self,
         context: &mut SamplerContext,

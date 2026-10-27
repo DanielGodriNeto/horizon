@@ -19,10 +19,18 @@ impl FluidStatus {
 }
 pub trait FluidPicker: std::fmt::Debug + Send + Sync {
     fn compute(&self, position: [i32; 3]) -> FluidStatus;
+    /// A height from which `compute(..).at(y, air)` is air for every `y` at or
+    /// above it, or `None` when the picker cannot promise that.
+    fn air_from(&self) -> Option<i32> {
+        None
+    }
 }
 impl<P: FluidPicker + ?Sized> FluidPicker for &P {
     fn compute(&self, position: [i32; 3]) -> FluidStatus {
         P::compute(self, position)
+    }
+    fn air_from(&self) -> Option<i32> {
+        P::air_from(self)
     }
 }
 /// State IDs must come from one immutable block registry. Default fluid can be
@@ -70,6 +78,9 @@ impl FluidPicker for GlobalFluidPicker {
             }
         }
     }
+    fn air_from(&self) -> Option<i32> {
+        Some(if self.disabled { i32::MIN } else { self.sea_level })
+    }
 }
 #[derive(Debug)]
 pub struct DisabledAquifer<P> {
@@ -91,5 +102,8 @@ impl<P: FluidPicker> DisabledAquifer<P> {
     }
     pub const fn should_schedule_fluid_update(&self) -> bool {
         false
+    }
+    pub fn air_from(&self) -> Option<i32> {
+        self.picker.air_from()
     }
 }
