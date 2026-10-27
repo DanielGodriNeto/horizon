@@ -82,6 +82,23 @@ public final class LoadProbe {
             System.out.println("PROBE " + kind + " " + name + " ADAPTER " + adapter);
             return;
         }
+        int ref = name.indexOf("::");
+        if (ref >= 0) {
+            // "Class::member" entrypoints name a static field or method: only the class is loaded and initialised.
+            String[] part = {"CLASS_ONLY", "member " + name.substring(ref + 2) + " not run"};
+            Thread c = new Thread(() -> {
+                try {
+                    Class.forName(name.substring(0, ref), true, loader);
+                } catch (Throwable e) {
+                    fail(part, "load", e);
+                }
+            });
+            c.setDaemon(true);
+            c.start();
+            c.join(TIMEOUT_MS);
+            System.out.println("PROBE " + kind + " " + name + " " + (c.isAlive() ? "TIMEOUT" : part[0]) + " " + part[1]);
+            return;
+        }
         String[] result = {"LOADED", "-"};
         Thread t = new Thread(() -> run(loader, name, kind, result));
         t.setDaemon(true);
