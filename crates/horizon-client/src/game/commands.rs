@@ -89,6 +89,10 @@ impl Game<'_> {
         if self.mod_command(command) {
             return true;
         }
+        #[cfg(feature = "foreign")]
+        if self.java_command(None, command) {
+            return true;
+        }
         let d = vanilla::game_dispatcher();
         let parse = d.parse(command, &self.ui.registries);
         let result = match parse.executable() {

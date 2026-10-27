@@ -39,5 +39,13 @@ do shim, por reflexão), grava os registros em B **antes** de `java_ready = 1` e
 | 1 REGISTER_ITEM | Java -> Rust | u16 tamanho do id, id UTF-8 (`ns:path`), JSON de conteúdo do item |
 | 2 BLOCK_BREAK | Rust -> Java | u64 seq, i32 x, i32 y, i32 z, id do bloco UTF-8 (resto) |
 | 3 REPLY | Java -> Rust | u64 seq, mensagens que o mod mandou ao jogador (UTF-8, `\n` entre elas; vazio se nenhuma) |
+| 4 TICK | Rust -> Java | u64 seq, u64 tick (fim do tick: `ServerTickEvents.END_SERVER_TICK`) |
+| 5 COMMAND | Rust -> Java | u64 seq, linha do comando sem a barra (UTF-8, resto) |
+| 6 REGISTER_COMMAND | Java -> Rust | palavra do comando UTF-8 (registrada via `CommandRegistrationCallback`; gravada antes de `java_ready`) |
 
-Cada BLOCK_BREAK gera exatamente um REPLY com o mesmo seq (o callback `PlayerBlockBreakEvents.AFTER` do mod roda no meio).
+Cada BLOCK_BREAK, TICK e COMMAND gera exatamente um REPLY com o mesmo seq (o callback do mod roda no meio). O jogo só
+manda COMMAND se a primeira palavra foi registrada por REGISTER_COMMAND, e segura TICKs enquanto houver 8 sem resposta.
+
+### Linhas da ponte (`p3-bench --bridge`, stdin/stdout do processo)
+Entrada: `B seq x y z bloco`, `T seq tick`, `C seq linha`. Saída: `I id json` (item), `K palavra` (comando), `READY`,
+`R seq texto` (`\n` das mensagens vira U+001F). O `seq` da linha é o do jogo e volta no `R`; o seq do anel é separado.

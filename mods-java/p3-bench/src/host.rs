@@ -12,6 +12,9 @@ use crate::sidecar::Side;
 const REGISTER_ITEM: u8 = 1;
 const BLOCK_BREAK: u8 = 2;
 const REPLY: u8 = 3;
+const TICK: u8 = 4;
+const COMMAND: u8 = 5;
+const REGISTER_COMMAND: u8 = 6;
 const BLOCK: &str = "minecraft:stone";
 const WARMUP: usize = 500;
 
@@ -26,6 +29,7 @@ pub struct ItemReg {
 #[derive(Default)]
 struct Inbox {
     items: Vec<ItemReg>,
+    commands: Vec<String>,
     replies: Vec<(u64, String)>,
 }
 
@@ -42,6 +46,7 @@ fn parse(msg: &[u8], inbox: &mut Inbox) -> Res<()> {
             let json = &msg[3 + n..];
             inbox.items.push(ItemReg { id: String::from_utf8(id.to_vec())?, json: String::from_utf8(json.to_vec())? });
         }
+        Some(&REGISTER_COMMAND) => inbox.commands.push(String::from_utf8(msg[1..].to_vec())?),
         Some(&REPLY) if msg.len() >= 9 => {
             let seq = u64::from_le_bytes(msg[1..9].try_into()?);
             inbox.replies.push((seq, String::from_utf8(msg[9..].to_vec())?));
@@ -51,14 +56,34 @@ fn parse(msg: &[u8], inbox: &mut Inbox) -> Res<()> {
     Ok(())
 }
 
-/// Evento de quebra de bloco `seq` (número do anel) em `pos`.
-fn break_event(seq: u64, pos: [i32; 3], block: &str) -> Vec<u8> {
-    let mut m = vec![BLOCK_BREAK];
+/// Cabeçalho de um evento do host: tipo e `seq` (número do anel).
+fn header(kind: u8, seq: u64) -> Vec<u8> {
+    let mut m = vec![kind];
     m.extend(seq.to_le_bytes());
+    m
+}
+
+/// Evento de quebra de bloco `seq` em `pos`.
+fn break_event(seq: u64, pos: [i32; 3], block: &str) -> Vec<u8> {
+    let mut m = header(BLOCK_BREAK, seq);
     for coord in pos {
         m.extend(coord.to_le_bytes());
     }
     m.extend(block.as_bytes());
+    m
+}
+
+/// Fim de tick `tick`.
+fn tick_event(seq: u64, tick: u64) -> Vec<u8> {
+    let mut m = header(TICK, seq);
+    m.extend(tick.to_le_bytes());
+    m
+}
+
+/// Comando digitado (sem a barra).
+fn command_event(seq: u64, line: &str) -> Vec<u8> {
+    let mut m = header(COMMAND, seq);
+    m.extend(line.as_bytes());
     m
 }
 
@@ -94,11 +119,11 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// Manda o evento e espera a resposta dele (números do anel em sequência). Devolve o texto do mod.
-    fn event(&mut self, side: &mut Side, pos: [i32; 3], block: &str) -> Res<String> {
+    /// Manda o evento (`build` recebe o número do anel) e espera a resposta dele. Devolve o texto do mod.
+    fn event(&mut self, side: &mut Side, build: impl FnOnce(u64) -> Vec<u8>) -> Res<String> {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.send(side, &break_event(seq, pos, block))?;
+        self.send(side, &build(seq))?;
         wait_until("resposta do mod", || {
             self.drain()?;
             Ok(self.inbox.replies.len() as u64 > seq)
@@ -113,7 +138,7 @@ impl<'a> Session<'a> {
     /// Uma viagem do bench: evento `seq` até a resposta conferida. Devolve µs.
     fn trip(&mut self, side: &mut Side, seq: u64) -> Res<f64> {
         let start = Instant::now();
-        let text = self.event(side, [seq as i32, 64, -(seq as i32)], BLOCK)?;
+        let text = self.event(side, |n| break_event(n, [seq as i32, 64, -(seq as i32)], BLOCK))?;
         let elapsed = micros(start.elapsed());
         let (got, _) = &self.inbox.replies[seq as usize];
         let want = format!("gem {} {BLOCK} 64", seq + 1);
@@ -133,8 +158,9 @@ fn open<'a>(side: &mut Side, shared: &'a Shared) -> Res<(Session<'a>, Vec<ItemRe
     Ok((s, items))
 }
 
-/// Ponte de linhas para o jogo (stdin/stdout). Saída: `I <id> <json>` por item, `READY`.
-/// Entrada: `B <seq> <x> <y> <z> <bloco>`; saída: `R <seq> <mensagens>` (quebra de linha vira U+001F). EOF em stdin encerra.
+/// Ponte de linhas para o jogo (stdin/stdout). Saída: `I <id> <json>` por item, `K <palavra>` por comando, `READY`.
+/// Entrada: `B <seq> <x> <y> <z> <bloco>`, `T <seq> <tick>` ou `C <seq> <linha>`; saída: `R <seq> <mensagens>`
+/// (quebra de linha vira U+001F). EOF em stdin encerra.
 pub fn bridge(side: &mut Side, shared: &Shared) -> Res<()> {
     use std::io::{BufRead, Write};
     let (mut s, items) = open(side, shared)?;
@@ -142,15 +168,33 @@ pub fn bridge(side: &mut Side, shared: &Shared) -> Res<()> {
     for i in &items {
         writeln!(out, "I {} {}", i.id, i.json)?;
     }
+    for name in std::mem::take(&mut s.inbox.commands) {
+        writeln!(out, "K {name}")?;
+    }
     writeln!(out, "READY")?;
     out.flush()?;
     for line in std::io::stdin().lock().lines() {
         let line = line?;
-        let f: Vec<&str> = line.splitn(6, ' ').collect();
-        let ["B", seq, x, y, z, block] = f[..] else {
+        let Some((kind, rest)) = line.split_once(' ') else {
             return Err(format!("linha da ponte inválida: {line:?}").into());
         };
-        let text = s.event(side, [x.parse()?, y.parse()?, z.parse()?], block)?;
+        let (seq, arg) = rest.split_once(' ').ok_or_else(|| format!("linha da ponte inválida: {line:?}"))?;
+        let text = match kind {
+            "B" => {
+                let f: Vec<&str> = arg.splitn(4, ' ').collect();
+                let [x, y, z, block] = f[..] else {
+                    return Err(format!("linha da ponte inválida: {line:?}").into());
+                };
+                let pos = [x.parse()?, y.parse()?, z.parse()?];
+                s.event(side, |n| break_event(n, pos, block))?
+            }
+            "T" => {
+                let tick = arg.parse()?;
+                s.event(side, |n| tick_event(n, tick))?
+            }
+            "C" => s.event(side, |n| command_event(n, arg))?,
+            _ => return Err(format!("linha da ponte inválida: {line:?}").into()),
+        };
         writeln!(out, "R {seq} {}", text.replace('\n', "\u{1f}"))?;
         out.flush()?;
     }
