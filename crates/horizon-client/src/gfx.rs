@@ -364,6 +364,8 @@ pub struct Renderer {
     /// (see `startup_step`).
     first_frame: FirstFrame,
     gpu_timer: Option<timing::GpuTimer>,
+    /// GPU time of the frame's own passes, with `HORIZON_PASS_TIMING` set.
+    frame_timing: Option<pack_timing::PassTiming>,
     /// Frame number and GPU frame time (ms) of the frames read back since
     /// the caller last drained them.
     pub gpu_times: Vec<(u64, f32)>,
@@ -2526,6 +2528,8 @@ impl Renderer {
             } else {
                 FirstFrame::Drawn
             },
+            frame_timing: std::env::var_os("HORIZON_PASS_TIMING")
+                .and_then(|_| pack_timing::PassTiming::new(&device, &queue)),
             gpu_timer,
             gpu_times: Vec::new(),
             lightmap_pixels: [0; 16 * 16 * 4],
@@ -3375,6 +3379,13 @@ impl Renderer {
     }
     /// Times the shader pack's passes on the GPU while `on` (the F3 overlay is open), or always
     /// with `HORIZON_SHADER_PACK_TIMING`.
+    /// GPU pass times read back since the last call (`HORIZON_PASS_TIMING`).
+    pub fn drain_frame_passes(&mut self) -> Vec<(String, f32)> {
+        self.frame_timing
+            .as_mut()
+            .map(pack_timing::PassTiming::drain)
+            .unwrap_or_default()
+    }
     pub fn set_pass_timing(&mut self, on: bool) {
         self.pass_timing = on || pack_timing::PassTiming::logging();
     }
@@ -4460,6 +4471,9 @@ impl Renderer {
         if let Some(timer) = &mut self.gpu_timer {
             timer.begin(&mut encoder);
         }
+        if let Some(t) = &mut self.frame_timing {
+            t.begin(&self.device, &self.queue);
+        }
         // The world's targets: the screen, or the scaled target of `post`.
         let pack_post = !frame.title && self.pack_post.as_ref().is_some_and(|p| p.1.is_some());
         // One of Horizon's own packs reads the same world target.
@@ -4619,6 +4633,7 @@ impl Renderer {
             })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Horizon world"),
+                timestamp_writes: self.frame_timing.as_mut().and_then(|t| t.writes("world")),
                 color_attachments: &attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: world_depth,
@@ -5060,6 +5075,7 @@ impl Renderer {
             })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("First-person hand"),
+                timestamp_writes: self.frame_timing.as_mut().and_then(|t| t.writes("hand")),
                 color_attachments: &attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
@@ -5100,6 +5116,10 @@ impl Renderer {
             })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Screen effects"),
+                timestamp_writes: self
+                    .frame_timing
+                    .as_mut()
+                    .and_then(|t| t.writes("screen effects")),
                 color_attachments: &attachments,
                 ..Default::default()
             });
@@ -5129,6 +5149,10 @@ impl Renderer {
             })];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("3d crosshair"),
+                timestamp_writes: self
+                    .frame_timing
+                    .as_mut()
+                    .and_then(|t| t.writes("crosshair")),
                 color_attachments: &attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
@@ -5225,6 +5249,9 @@ impl Renderer {
         if let Some(timer) = &mut self.gpu_timer {
             timer.submitted(&self.queue);
             timer.collect(&self.device, &mut self.gpu_times);
+        }
+        if let Some(t) = &mut self.frame_timing {
+            t.submitted(&self.queue);
         }
         if let Some(Some(timer)) = Self::pass_timer(&mut self.pack_post, &mut self.native) {
             timer.submitted(&self.queue);

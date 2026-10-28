@@ -42,6 +42,8 @@ pub struct PassTiming {
     /// `mark`'s pipeline, for the target format it was made for.
     marker: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     reports: usize,
+    /// Every pass time taken since `drain` was last called.
+    fresh: Vec<(String, f32)>,
 }
 
 impl PassTiming {
@@ -80,6 +82,7 @@ impl PassTiming {
             log: Self::logging(),
             marker: None,
             reports: 0,
+            fresh: Vec::new(),
         })
     }
 
@@ -229,6 +232,7 @@ impl PassTiming {
                     self.samples.len() - 1
                 }
             };
+            self.fresh.push((name.clone(), ms));
             let window = &mut self.samples[i].1;
             if window.len() == WINDOW {
                 window.pop_front();
@@ -248,6 +252,11 @@ impl PassTiming {
                 parts.join(", ")
             );
         }
+    }
+
+    /// The pass times collected since the last call.
+    pub fn drain(&mut self) -> Vec<(String, f32)> {
+        std::mem::take(&mut self.fresh)
     }
 
     /// Each pass's median time in milliseconds over its last timed frames, in the order the

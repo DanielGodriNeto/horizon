@@ -422,6 +422,10 @@ pub struct FrameStats {
     gpu: Vec<f32>,
     /// Milliseconds per frame phase (`PHASES`), one entry per rendered frame.
     phases: Vec<[f32; PHASES.len()]>,
+    /// Wall and thread-CPU milliseconds summed per timed span (`spans`), over all frames.
+    spans: std::collections::BTreeMap<&'static str, (f64, f64)>,
+    /// Sum and count of the GPU time of each of the frame's passes.
+    gpu_passes: std::collections::BTreeMap<String, (f64, u32)>,
 }
 
 /// The parts of a frame's CPU time: world streaming and uploads, game ticks,
@@ -458,6 +462,20 @@ impl FrameStats {
     pub fn record_cpu(&mut self, millis: f32) {
         if self.cpu.len() < Self::LIMIT {
             self.cpu.push(millis);
+        }
+    }
+    pub fn record_spans(&mut self, spans: &[crate::spans::Span]) {
+        for s in spans {
+            let sum = self.spans.entry(s.name).or_default();
+            sum.0 += f64::from(s.ms);
+            sum.1 += f64::from(s.cpu_ms);
+        }
+    }
+    pub fn record_gpu_passes(&mut self, passes: Vec<(String, f32)>) {
+        for (name, ms) in passes {
+            let sum = self.gpu_passes.entry(name).or_default();
+            sum.0 += f64::from(ms);
+            sum.1 += 1;
         }
     }
     pub fn record_phases(&mut self, millis: [f32; PHASES.len()]) {
@@ -507,6 +525,8 @@ impl FrameStats {
         self.cpu.clear();
         self.gpu.clear();
         self.phases.clear();
+        self.spans.clear();
+        self.gpu_passes.clear();
     }
     pub fn summary(&self) -> serde_json::Value {
         let mut sorted = self.millis.clone();
@@ -550,6 +570,12 @@ impl FrameStats {
             "gpu": percentiles(&self.gpu),
             "phases_avg_ms": self.phase_average(0.0),
             "slow_phases_avg_ms": slow_phases,
+            "gpu_passes_avg_ms": self.gpu_passes.iter().map(|(name, &(sum, k))| {
+                (name.clone(), (sum / f64::from(k.max(1))).into())
+            }).collect::<serde_json::Map<_, _>>(),
+            "spans_avg_ms": self.spans.iter().map(|(name, &(wall, cpu))| {
+                (name.to_string(), serde_json::json!({ "wall": wall / n as f64, "cpu": cpu / n as f64 }))
+            }).collect::<serde_json::Map<_, _>>(),
         })
     }
 }

@@ -77,6 +77,8 @@ mod initial_spawn;
 mod integrated;
 mod item_draw;
 mod item_particles;
+#[cfg(feature = "foreign")]
+mod java_mods;
 mod jukebox;
 mod lan;
 mod lan_actions;
@@ -166,8 +168,6 @@ mod scoreboard;
 mod screens;
 mod sculk;
 mod sculk_fixture;
-#[cfg(feature = "foreign")]
-mod java_mods;
 mod server_links;
 mod server_mods;
 mod server_packs;
@@ -13354,6 +13354,7 @@ impl ApplicationHandler for Game<'_> {
                     {
                         let cpu = now.elapsed().saturating_sub(r.last_wait).as_secs_f32() * 1000.0;
                         let spans = horizon_client::spans::take();
+                        self.frame_stats.record_spans(&spans);
                         if cpu > threshold {
                             // The render thread's own CPU time in the frame:
                             // far below the wall time, the frame waited.
@@ -13409,6 +13410,7 @@ impl ApplicationHandler for Game<'_> {
                         }
                         let gpu: Vec<f32> = r.gpu_times.iter().map(|&(_, gpu)| gpu).collect();
                         self.frame_stats.record_gpu(&gpu);
+                        self.frame_stats.record_gpu_passes(r.drain_frame_passes());
                         r.gpu_times.clear();
                     }
                     self.limit_frame();

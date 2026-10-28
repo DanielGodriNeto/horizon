@@ -235,6 +235,24 @@ fn run(control: &Control, setup: Setup) -> Result<PathBuf, String> {
             &[frames.low_01pct_fps],
         );
         report.frames.push(frames);
+        // With HORIZON_PASS_TIMING set, the GPU time of each pass, in ms.
+        for (pass, v) in flight["gpu_passes_avg_ms"]
+            .as_object()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(v) = v.as_f64() {
+                report.metric(&format!("gpu_pass.{name}.{pass}_ms"), &[v]);
+            }
+        }
+        // With HORIZON_SPIKES set, the flight's timed spans, in ms per frame.
+        for (span, t) in flight["spans_avg_ms"].as_object().into_iter().flatten() {
+            for kind in ["wall", "cpu"] {
+                if let Some(v) = t[kind].as_f64() {
+                    report.metric(&format!("spans.{name}.{span}.{kind}_ms"), &[v]);
+                }
+            }
+        }
     }
 
     let status = control.status();
