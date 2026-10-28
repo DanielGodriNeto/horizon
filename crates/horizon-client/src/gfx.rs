@@ -123,9 +123,11 @@ fn world_pass_after_culling<'e>(
     view: &wgpu::TextureView,
     depth: &wgpu::TextureView,
     keep_depth: bool,
+    timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
 ) -> wgpu::RenderPass<'e> {
     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("Horizon world, after culling"),
+        timestamp_writes,
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view,
             resolve_target: None,
@@ -4709,13 +4711,17 @@ impl Renderer {
                             flat.draw(&mut pass, &flat.calls[..flat.phase1_calls], vertices);
                             cull.test(&mut pass);
                             drop(pass);
-                            cull.test_pass(&mut encoder);
+                            cull.test_pass(
+                                &mut encoder,
+                                self.frame_timing.as_mut().and_then(|t| t.writes("culling test")),
+                            );
                             flat.flatten_phase2(&mut encoder);
                             pass = world_pass_after_culling(
                                 &mut encoder,
                                 world_view,
                                 world_depth,
                                 pack_reads_world,
+                                self.frame_timing.as_mut().and_then(|t| t.writes("world phase 2")),
                             );
                             pass.set_bind_group(0, &self.group, &[]);
                             pack_frame(&mut pass);
@@ -4740,12 +4746,16 @@ impl Renderer {
                             self.draw_sections(&mut pass, &self.indirect, 0, 0, phase1_draws);
                             cull.test(&mut pass);
                             drop(pass);
-                            cull.test_pass(&mut encoder);
+                            cull.test_pass(
+                                &mut encoder,
+                                self.frame_timing.as_mut().and_then(|t| t.writes("culling test")),
+                            );
                             pass = world_pass_after_culling(
                                 &mut encoder,
                                 world_view,
                                 world_depth,
                                 pack_reads_world,
+                                self.frame_timing.as_mut().and_then(|t| t.writes("world phase 2")),
                             );
                             pass.set_bind_group(0, &self.group, &[]);
                             pack_frame(&mut pass);
